@@ -20,6 +20,7 @@ import { createLogger } from "../../../observability/logger";
 import Redis from "ioredis";
 import { createRedisClient } from "../../../infrastructure/cache/createRedisClient";
 import { getWebchatJwtSecret } from "../../../middleware/customerAuth";
+import { TakeoverManager } from "../../../human-takeover/TakeoverManager";
 
 const logger = createLogger("WebChatGateway");
 
@@ -154,6 +155,11 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
   const identityRepo = new PostgresIdentityRepository();
   const profileRepo = new PostgresProfileRepository();
   const sessionRepo = new PostgresWebChatSessionRepository();
+  // Same default construction as the Orchestrator's: Redis-backed when
+  // CACHE_PROVIDER=redis, otherwise the shared file-backed store. Both read the
+  // state /api/v1/internal/sessions/resolve reports, so the gate below and the
+  // flow's own check cannot disagree.
+  const takeoverManager = new TakeoverManager();
 
   // Setup Redis Subscriber once
   if (!redisSub) {
@@ -713,26 +719,86 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
             const projName = row.project_name;
             const compName = row.company_name;
 
-            if (identityId && identityId !== "guest") {
-              const identRow = await pool.query("SELECT profile_id FROM identities WHERE id = $1", [parseInt(identityId, 10)]);
+            // Hoisted: the token signed below must carry this. Scoping it to the
+            // block meant the fresh token went out without a profileId, and
+            // customerAuth.ts:75 rejects any portal credential missing one — so
+            // /api/portal/profile, /projects and the save button all answered
+            // 403 immediately after the bot said "ยืนยันตัวตนสำเร็จ".
+            let resolvedIdentityId: string | null = (identityId && identityId !== "guest") ? identityId : null;
+            let joinedProfileId: string | null = null;
+
+            if (resolvedIdentityId && !isNaN(parseInt(resolvedIdentityId, 10))) {
+              const identRow = await pool.query("SELECT profile_id FROM identities WHERE id = $1", [parseInt(resolvedIdentityId, 10)]);
               const pId = identRow.rows[0]?.profile_id;
-              if (pId) {
-                await pool.query(
-                  `INSERT INTO profile_projects (profile_id, project_id, created_at)
-                   VALUES ($1, $2, NOW())
-                   ON CONFLICT (profile_id, project_id) DO NOTHING`,
-                  [pId, parseInt(newProjectId, 10)]
-                );
-                await pool.query(
-                  `UPDATE profiles SET company_id = $1 WHERE id = $2`,
-                  [parseInt(newCompanyId, 10), pId]
-                );
+              joinedProfileId = pId ? String(pId) : null;
+            }
+
+            // Fallback 1: query by channelRef
+            if (!joinedProfileId && channelRef && channelRef !== "guest") {
+              const identRow = await pool.query(
+                "SELECT id, profile_id FROM identities WHERE LOWER(channel) = 'webchat' AND channel_ref = $1 LIMIT 1",
+                [channelRef]
+              );
+              if (identRow.rows.length > 0) {
+                resolvedIdentityId = String(identRow.rows[0].id);
+                joinedProfileId = identRow.rows[0].profile_id ? String(identRow.rows[0].profile_id) : null;
               }
             }
 
+            // Fallback 2: query conversation identity
+            if (!joinedProfileId && conversationId) {
+              const convRow = await pool.query(
+                "SELECT identity_id FROM conversations WHERE id = $1 LIMIT 1",
+                [conversationId]
+              );
+              if (convRow.rows.length > 0 && convRow.rows[0].identity_id) {
+                resolvedIdentityId = String(convRow.rows[0].identity_id);
+                const identRow = await pool.query("SELECT profile_id FROM identities WHERE id = $1", [parseInt(resolvedIdentityId, 10)]);
+                joinedProfileId = identRow.rows[0]?.profile_id ? String(identRow.rows[0].profile_id) : null;
+              }
+            }
+
+            // Fallback 3: check ticketData profileId
+            if (!joinedProfileId && (ticketData as any).profileId && (ticketData as any).profileId !== "guest") {
+              joinedProfileId = String((ticketData as any).profileId);
+            }
+
+            // Fallback 4: create authoritative customer profile and identity if missing
+            if (!joinedProfileId) {
+              const nextProfileIdRes = await pool.query("SELECT COALESCE(MAX(CASE WHEN id::text ~ '^[0-9]+$' THEN id::bigint ELSE 0 END), 0) + 1 AS next_id FROM profiles");
+              joinedProfileId = String(nextProfileIdRes.rows[0].next_id);
+              const nextIdentId = await nextSequenceId(pool, "identities");
+              resolvedIdentityId = String(nextIdentId);
+
+              await pool.query(
+                `INSERT INTO profiles (id, company_id, name, created_at, is_pii_erased, is_merged)
+                 VALUES ($1, $2, $3, NOW(), false, false)`,
+                [joinedProfileId, parseInt(newCompanyId, 10), `Customer_${channelRef.slice(0, 8)}`]
+              );
+
+              await pool.query(
+                `INSERT INTO identities (id, profile_id, channel, channel_ref, created_at, is_pii, is_shared_account)
+                 VALUES ($1, $2, 'WebChat', $3, NOW(), false, false)`,
+                [nextIdentId, joinedProfileId, channelRef]
+              );
+            }
+
+            if (joinedProfileId) {
+              await pool.query(
+                `INSERT INTO profile_projects (profile_id, project_id, created_at)
+                 VALUES ($1, $2, NOW())
+                 ON CONFLICT (profile_id, project_id) DO NOTHING`,
+                [joinedProfileId, parseInt(newProjectId, 10)]
+              );
+              await pool.query(
+                `UPDATE profiles SET company_id = $1 WHERE id::text = $2`,
+                [parseInt(newCompanyId, 10), joinedProfileId]
+              );
+            }
+
             await pool.query(
-              `UPDATE conversations SET project_id = $1, org_id = $2, status = 'open' WHERE id = $3`,
-              [parseInt(newProjectId, 10), row.org_id || 'org_default', conversationId]
+              `UPDATE conversations SET project_id = $1, org_id = $2, status = 'open', identity_id = COALESCE($4, identity_id) WHERE id = $3`,
+              [parseInt(newProjectId, 10), row.org_id || 'org_default', conversationId, resolvedIdentityId ? parseInt(resolvedIdentityId, 10) : null]
             );
 
             const jwtSecret = getWebchatJwtSecret();
@@ -743,10 +809,17 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
             // so every reload silently dropped the upgraded session back to
             // guest — the bot had said "ยืนยันตัวตนสำเร็จ" and the portal still
             // showed the guest gate, 0 projects and a 403 on /api/portal/profile.
+            // Two claims are load-bearing and were both missing at different
+            // times, producing two different symptoms:
+            //   customerId — the handshake (line ~223) rejects a proof without
+            //                it, so every reload 401'd back to guest.
+            //   profileId  — customerAuth.ts:75 rejects a portal credential
+            //                without it, so /api/portal/* answered 403.
             const freshSessionToken = JwtUtil.sign(
               {
                 customerId: channelRef,
-                identityId,
+                identityId: resolvedIdentityId || identityId,
+                profileId: joinedProfileId,
                 channelRef,
                 role: "customer",
                 projectId: newProjectId,
@@ -756,6 +829,13 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
               jwtSecret,
               86400
             );
+
+            if (!joinedProfileId) {
+              logger.warn(
+                { identityId, conversationId, projectId: newProjectId },
+                "Join code accepted but the identity has no profile; portal routes will refuse this token"
+              );
+            }
 
             const successText = `✅ ยืนยันตัวตนสำเร็จ!\nยินดีต้อนรับสู่โครงการ **${projName}** (${compName || ''})\n\nขณะนี้ระบบพร้อมให้บริการแล้วค่ะ ท่านสามารถสอบถามข้อมูล แจ้งปัญหาการใช้งาน หรือขอความช่วยเหลือได้ทันทีค่ะ`;
 
@@ -791,6 +871,54 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
         }
 
         const receivedAtStr = new Date().toISOString();
+
+        // Human takeover gate.
+        //
+        // While an operator holds the conversation the AI must not answer over
+        // them. Note this is deliberately STRONGER than what LINE has: neither
+        // lineWebhook nor AgentSessionQueueWorker blocks anything — suppression
+        // there is pull-based, with the PromptX flow calling back into
+        // /api/v1/internal/sessions/resolve and honouring `isHumanTakeover`
+        // itself. Whether the WebChat flow makes that call is unknown, so the
+        // boundary is enforced here rather than trusted to flow logic.
+        //
+        // The insert is not optional: this path does not otherwise persist the
+        // customer's message (the only other INSERT is the join-code reply), so
+        // skipping the enqueue without writing the row would make the message
+        // disappear instead of reaching the operator it was meant for.
+        try {
+          const takeoverState = await takeoverManager.getTakeoverState(String(conversationId));
+          if (takeoverState.status === "ACTIVE_HUMAN" || takeoverState.status === "PENDING_HUMAN") {
+            await pool.query(
+              `INSERT INTO messages (conversation_id, role, content, message_type, created_at)
+               VALUES ($1, 'customer', $2, 'text', NOW())`,
+              [conversationId, parsed.data.text]
+            );
+
+            broadcastToRoom(room, {
+              event: "message",
+              data: {
+                id: randomUUID(),
+                role: "customer",
+                content: parsed.data.text,
+                createdAt: receivedAtStr
+              }
+            }, socket);
+
+            logger.info(
+              { conversationId, status: takeoverState.status, agent: takeoverState.assignedHumanAgentId },
+              "WebChat message withheld from AI: human takeover active"
+            );
+            return;
+          }
+        } catch (takeoverErr: any) {
+          // Failing open is the lesser evil: a takeover lookup that errors must
+          // not swallow the customer's message. Worst case the AI answers
+          // alongside the operator, which is visible and recoverable; a silently
+          // dropped message is neither.
+          logger.error({ error: takeoverErr.message, conversationId }, "Takeover check failed; forwarding to AI");
+        }
+
         const inboundMsg = {
           senderId: channelRef,
           channel: "WebChat" as const,
@@ -799,7 +927,7 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
           companyId
         };
 
-        // Delegate to background BullMQ queue immediately
+        // Delegate to background queue immediately (maxRetry: 0 to prevent duplicate flow runs)
         const jobQueue = QueueFactory.getQueue();
         const requestId = randomUUID();
         await jobQueue.enqueue({
@@ -808,7 +936,8 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
           metadata: {
             requestId,
             receivedAt: receivedAtStr
-          }
+          },
+          maxRetry: 0
         });
 
         // Broadcast back to current room to sync other user tabs
@@ -911,5 +1040,40 @@ function broadcastToRoom(room: string, payload: any, skipSocket?: any) {
     if (socket !== skipSocket && socket.readyState === 1) { // 1 = OPEN
       socket.send(payloadStr);
     }
+  }
+}
+
+/**
+ * Direct in-memory delivery bridge for outbound messages (e.g. from BullMQ worker
+ * when PromptX replies), ensuring delivery even when Redis is down or unavailable.
+ */
+export function broadcastWebChatOutbound(payload: {
+  conversationId?: string | number;
+  recipientId?: string;
+  text?: string;
+  content?: string;
+  id?: string;
+  role?: string;
+  sentAt?: string;
+  attachments?: any[];
+  actions?: any[];
+}) {
+  const msgPayload = {
+    event: "message",
+    data: {
+      id: payload.id || randomUUID(),
+      role: payload.role || "ai",
+      content: payload.text || payload.content || "",
+      createdAt: payload.sentAt || new Date().toISOString(),
+      attachments: payload.attachments || [],
+      actions: Array.isArray(payload.actions) ? payload.actions : undefined
+    }
+  };
+
+  if (payload.conversationId) {
+    broadcastToRoom(`conversation:${payload.conversationId}`, msgPayload);
+  }
+  if (payload.recipientId) {
+    broadcastToRoom(`recipient:${payload.recipientId}`, msgPayload);
   }
 }

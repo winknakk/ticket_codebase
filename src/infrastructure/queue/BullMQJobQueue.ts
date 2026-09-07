@@ -74,7 +74,8 @@ export class BullMQJobQueue implements IJobQueue {
       await this.platformEventQueue.add(payload.type, payload, { jobId });
     } else {
       logger.info({ jobId, type: payload.type }, "Enqueueing message job to BullMQ queue");
-      await this.queue.add("incoming-message", payload, { jobId });
+      const attempts = payload.maxRetry !== undefined ? (payload.maxRetry + 1) : 3;
+      await this.queue.add("incoming-message", payload, { jobId, attempts });
     }
 
     return jobId;

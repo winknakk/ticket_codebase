@@ -93,7 +93,7 @@ import { OutboxProcessor } from "../infrastructure/db/OutboxProcessor";
 import { requestContextStorage } from "../shared/context/RequestContextHolder";
 import websocketPlugin from "@fastify/websocket";
 import { tenantPlugin } from "./plugins/tenantPlugin";
-import WebChatGateway from "../presentation/http/routes/WebChatGateway";
+import WebChatGateway, { broadcastWebChatOutbound } from "../presentation/http/routes/WebChatGateway";
 import Redis from "ioredis";
 import { LineProjectOnboardingService } from "../services/LineProjectOnboardingService";
 
@@ -143,15 +143,22 @@ if (redisPub) {
   );
 }
 
-/** Publishes only when Redis is configured; a no-op otherwise. */
+/** Publishes to Redis for multi-instance clusters and performs direct in-memory broadcast for local sockets. */
 async function publishOutbound(channel: string, payload: string): Promise<void> {
+  try {
+    const parsed = JSON.parse(payload);
+    broadcastWebChatOutbound(parsed);
+  } catch (err: any) {
+    serverLogger.warn({ error: err.message }, "Direct in-memory broadcast error");
+  }
+
   if (!redisPub) return;
   try {
     await redisPub.publish(channel, payload);
   } catch (err: any) {
     // Delivery over Redis is best-effort: the message is already persisted,
     // and failing here must not abort the caller's request.
-    serverLogger.warn({ error: err.message, channel }, "Failed to publish outbound event");
+    serverLogger.warn({ error: err.message, channel }, "Failed to publish outbound event to Redis");
   }
 }
 
@@ -616,7 +623,7 @@ async function bootstrap() {
           org_id: convOrgId,
           destination: "default",
           received_at: new Date().toISOString()
-        }, { timeout: 45000 });
+        }, { timeout: 180000 });
 
         const data = response.data || {};
         const replyText = String(
