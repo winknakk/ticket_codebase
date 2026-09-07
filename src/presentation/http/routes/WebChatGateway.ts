@@ -1,6 +1,7 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { z } from "zod";
 import { randomUUID, createHash } from "crypto";
+import path from "path";
 import { JwtUtil } from "../../../shared/jwt";
 import { pool } from "../../../adapters/postgres/PostgresAdapter";
 import { nextSequenceId } from "../../../adapters/postgres/sequences";
@@ -21,6 +22,8 @@ import Redis from "ioredis";
 import { createRedisClient } from "../../../infrastructure/cache/createRedisClient";
 import { getWebchatJwtSecret } from "../../../middleware/customerAuth";
 import { TakeoverManager } from "../../../human-takeover/TakeoverManager";
+import { S3MediaStorageService } from "../../../media/services/S3MediaStorageService";
+import { adminSocketRegistry } from "../../../api/AdminSocketRegistry";
 
 const logger = createLogger("WebChatGateway");
 
@@ -171,27 +174,39 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
       if (channel === "webchat:outbound") {
         try {
           const payload = JSON.parse(message);
-          const msgPayload = {
+          const outEvent = payload.event || (payload.type === "takeover_started" ? "takeover_started" : "message");
+          const msgPayload = outEvent === "message" ? {
             event: "message",
             data: {
               id: payload.id || randomUUID(),
               role: payload.role || "ai",
-              content: payload.text,
+              content: payload.text || payload.content || "",
               createdAt: payload.sentAt || new Date().toISOString(),
               attachments: payload.attachments || [],
-              // Optional quick-action chips. Kept optional so the three existing
-              // publishers (takeover_change, PromptX reply, human reply) keep
-              // working untouched.
               actions: Array.isArray(payload.actions) ? payload.actions : undefined
+            }
+          } : {
+            event: outEvent,
+            data: {
+              conversation_id: String(payload.data?.conversation_id || payload.data?.conversationId || payload.conversationId || ""),
+              conversationId: String(payload.data?.conversationId || payload.data?.conversation_id || payload.conversationId || ""),
+              state: String(payload.data?.state || payload.data?.status || payload.state || payload.status || "PENDING_HUMAN"),
+              status: String(payload.data?.status || payload.data?.state || payload.status || payload.state || "PENDING_HUMAN"),
+              reason: String(payload.data?.reason || payload.reason || "ai_escalation"),
+              reasonCode: String(payload.data?.reasonCode || payload.reasonCode || "AI_ESCALATED_HUMAN"),
+              sentAt: payload.sentAt || payload.data?.sentAt || new Date().toISOString()
             }
           };
 
+          const targetRooms: string[] = [];
           if (payload.conversationId) {
-            broadcastToRoom(`conversation:${payload.conversationId}`, msgPayload);
+            targetRooms.push(`conversation:${payload.conversationId}`);
           }
           if (payload.recipientId) {
-            broadcastToRoom(`recipient:${payload.recipientId}`, msgPayload);
+            targetRooms.push(`recipient:${payload.recipientId}`);
           }
+
+          broadcastToRooms(targetRooms, msgPayload);
         } catch (err: any) {
           logger.error({ error: err.message }, "Failed to process Redis pub/sub message");
         }
@@ -508,6 +523,91 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
   });
 
   /**
+   * Endpoint: Presigned Upload URL Generation
+   * POST /api/v1/webchat/upload/presign
+   */
+  fastify.post("/api/v1/webchat/upload/presign", async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const body = request.body as any;
+      const fileName = String(body?.fileName || body?.filename || "attachment.jpg");
+      const fileType = String(body?.fileType || body?.filetype || "image/jpeg");
+      const fileSize = Number(body?.fileSize || body?.filesize || 0);
+
+      const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
+      if (fileSize > MAX_FILE_SIZE) {
+        return reply.code(400).send({ error: "File too large", message: "Maximum file size is 25MB" });
+      }
+
+      const ext = path.extname(fileName) || (fileType.includes("png") ? ".png" : fileType.includes("pdf") ? ".pdf" : ".jpg");
+      const sanitizedBase = path.basename(fileName, ext).replace(/[^a-zA-Z0-9_-]/g, "_");
+      const storageKey = `webchat_media/${sanitizedBase}_${Date.now()}_${randomUUID().slice(0, 8)}${ext}`;
+
+      const mediaService = new S3MediaStorageService({});
+      const uploadUrl = await mediaService.generateDirectUploadUrl(storageKey, 3600);
+      const fileUrl = await mediaService.generatePresignedUrl(storageKey, 86400 * 7);
+
+      return reply.code(200).send({
+        uploadUrl,
+        fileUrl,
+        storageKey,
+        fileName,
+        fileType,
+        fileSize
+      });
+    } catch (err: any) {
+      logger.error({ error: err.message }, "Failed to generate presigned upload URL");
+      return reply.code(500).send({ error: "Internal Server Error", message: err.message });
+    }
+  });
+
+  /**
+   * Endpoint: Direct Binary Upload Receiver
+   * PUT /api/v1/webchat/upload/direct
+   */
+  fastify.put("/api/v1/webchat/upload/direct", async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const query = request.query as any;
+      const { key, expires, signature } = query;
+
+      if (!key || !expires || !signature) {
+        return reply.code(400).send({ error: "Bad Request", message: "Missing required upload parameters" });
+      }
+
+      const mediaService = new S3MediaStorageService({});
+      const isValid = mediaService.verifyPresignedUrl(key, expires, signature);
+      if (!isValid) {
+        return reply.code(403).send({ error: "Forbidden", message: "Invalid or expired upload signature" });
+      }
+
+      let buffer: Buffer;
+      if (Buffer.isBuffer(request.body)) {
+        buffer = request.body;
+      } else if (typeof request.body === "string") {
+        buffer = Buffer.from(request.body);
+      } else if (request.raw) {
+        const chunks: Buffer[] = [];
+        for await (const chunk of request.raw) {
+          chunks.push(chunk);
+        }
+        buffer = Buffer.concat(chunks);
+      } else {
+        return reply.code(400).send({ error: "Bad Request", message: "Empty or invalid body payload" });
+      }
+
+      await mediaService.saveBuffer(key, buffer);
+
+      return reply.code(200).send({
+        success: true,
+        key,
+        size: buffer.length
+      });
+    } catch (err: any) {
+      logger.error({ error: err.message }, "Direct binary upload failed");
+      return reply.code(500).send({ error: "Internal Server Error", message: err.message });
+    }
+  });
+
+  /**
    * Endpoint: Ephemeral Single-Use WebSocket Ticket
    * POST /api/v1/webchat/ws-ticket
    * Issues a short-lived (10s) opaque ticket for WebSocket handshake.
@@ -662,16 +762,39 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
           return;
         }
 
-        // 3. Handle Text Message
-        const parsed = z.object({
-          text: z.string().min(1),
-          tempId: z.string().optional()
-        }).safeParse(payload);
+        // 3. Handle Inbound Customer Message (Text and/or Attachments)
+        const IncomingAttachmentSchema = z.object({
+          fileUrl: z.string().min(1),
+          fileName: z.string().optional().default("attachment"),
+          fileType: z.string().optional(),
+          fileSize: z.number().optional(),
+          storageKey: z.string().optional(),
+        });
 
+        const IncomingMessageSchema = z.object({
+          text: z.string().optional().default(""),
+          tempId: z.string().optional(),
+          attachments: z.array(IncomingAttachmentSchema).optional().default([])
+        });
+
+        const parsed = IncomingMessageSchema.safeParse(payload);
         if (!parsed.success) {
-          socket.send(JSON.stringify({ error: "Bad Request", message: "Message content cannot be empty" }));
+          socket.send(JSON.stringify({ error: "Bad Request", message: "Invalid message payload", details: parsed.error.issues }));
           return;
         }
+
+        const rawText = (parsed.data.text || "").trim();
+        const attachments = parsed.data.attachments || [];
+
+        if (!rawText && attachments.length === 0) {
+          socket.send(JSON.stringify({ error: "Bad Request", message: "Message content or attachments required" }));
+          return;
+        }
+
+        const messageText = rawText || (attachments[0]?.fileName ? `[ไฟล์แนบ: ${attachments[0].fileName}]` : '[ไฟล์แนบ]');
+        const messageType = attachments.length > 0 ? (attachments[0].fileType?.startsWith("image/") || attachments[0].fileUrl?.match(/\.(jpeg|jpg|png|webp|gif)/i) ? "image" : "file") : "text";
+        const externalId = (parsed.data.tempId && parsed.data.tempId.trim()) ? parsed.data.tempId.trim() : `webchat_${Date.now()}_${randomUUID().slice(0, 8)}`;
+        const tempId = externalId;
 
         // Ensure active conversation exists on message send
         let conversation = await conversationRepo.findActiveByIdentity(identityId, projectId);
@@ -698,7 +821,7 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
         activeConnections.get(room)!.add(socket);
 
         // Check if message is a project join code (format TX-XXXX-XXXX, or the 4-char hint)
-        const trimmedText = parsed.data.text.trim();
+        const trimmedText = rawText;
         const isJoinCodePattern = /^TX-[A-Z0-9]+-[A-Z0-9]+$/i.test(trimmedText) || /^[A-Z0-9]{4,6}$/i.test(trimmedText);
         if (isJoinCodePattern) {
           const codeHash = createHash("sha256").update(trimmedText.toUpperCase()).digest("hex");
@@ -872,62 +995,144 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
 
         const receivedAtStr = new Date().toISOString();
 
-        // Human takeover gate.
-        //
-        // While an operator holds the conversation the AI must not answer over
-        // them. Note this is deliberately STRONGER than what LINE has: neither
-        // lineWebhook nor AgentSessionQueueWorker blocks anything — suppression
-        // there is pull-based, with the PromptX flow calling back into
-        // /api/v1/internal/sessions/resolve and honouring `isHumanTakeover`
-        // itself. Whether the WebChat flow makes that call is unknown, so the
-        // boundary is enforced here rather than trusted to flow logic.
-        //
-        // The insert is not optional: this path does not otherwise persist the
-        // customer's message (the only other INSERT is the join-code reply), so
-        // skipping the enqueue without writing the row would make the message
-        // disappear instead of reaching the operator it was meant for.
+        // Check if customer has a valid, non-fallback project assigned
+        const currentConvRes = await pool.query(`SELECT project_id FROM conversations WHERE id = $1`, [conversationId]);
+        const convProjectId = String(currentConvRes.rows[0]?.project_id || "");
+
+        // Fail-closed tenant policy: never guess or fall back to project 1
+        if (!convProjectId || convProjectId === "1" || convProjectId === "undefined" || convProjectId === "null") {
+          logger.warn({ conversationId, identityId }, "WebChat customer attempted to send message without verified project context; prompting for join code");
+          const promptJoinMsg = "กรุณาระบุรหัสโครงการ (Join Code) เพื่อเข้าใช้งานระบบค่ะ";
+          socket.send(JSON.stringify({
+            event: "message",
+            data: {
+              id: randomUUID(),
+              role: "ai",
+              content: promptJoinMsg,
+              createdAt: new Date().toISOString()
+            }
+          }));
+          return;
+        }
+
+        // 2. Check Human Takeover Gate before forwarding to AI
+        let isHumanTakeover = false;
         try {
-          const takeoverState = await takeoverManager.getTakeoverState(String(conversationId));
-          if (takeoverState.status === "ACTIVE_HUMAN" || takeoverState.status === "PENDING_HUMAN") {
-            await pool.query(
-              `INSERT INTO messages (conversation_id, role, content, message_type, created_at)
-               VALUES ($1, 'customer', $2, 'text', NOW())`,
-              [conversationId, parsed.data.text]
-            );
-
-            broadcastToRoom(room, {
-              event: "message",
-              data: {
-                id: randomUUID(),
-                role: "customer",
-                content: parsed.data.text,
-                createdAt: receivedAtStr
-              }
-            }, socket);
-
+          const takeoverState = await takeoverManager.getTakeoverState(conversationId);
+          if (takeoverState && (takeoverState.status === "ACTIVE_HUMAN" || takeoverState.status === "PENDING_HUMAN")) {
+            isHumanTakeover = true;
             logger.info(
               { conversationId, status: takeoverState.status, agent: takeoverState.assignedHumanAgentId },
               "WebChat message withheld from AI: human takeover active"
             );
-            return;
           }
         } catch (takeoverErr: any) {
-          // Failing open is the lesser evil: a takeover lookup that errors must
-          // not swallow the customer's message. Worst case the AI answers
-          // alongside the operator, which is visible and recoverable; a silently
-          // dropped message is neither.
-          logger.error({ error: takeoverErr.message, conversationId }, "Takeover check failed; forwarding to AI");
+          logger.error({ error: takeoverErr.message, conversationId }, "Takeover check failed; falling through");
         }
 
+        // 3. Persist customer message to DB (atomic insert with ON CONFLICT)
+        let insertedMessageId: number | null = null;
+        if (conversationId) {
+          try {
+            const insertRes = await pool.query(
+              `INSERT INTO messages (conversation_id, role, content, message_type, external_id, created_at)
+               VALUES ($1, 'customer', $2, $3, $4, NOW())
+               ON CONFLICT (conversation_id, external_id) DO UPDATE SET
+                 content = EXCLUDED.content
+               RETURNING id`,
+              [conversationId, messageText, messageType, externalId]
+            );
+            if (insertRes.rows.length > 0) {
+              insertedMessageId = insertRes.rows[0].id;
+            } else {
+              const row = await pool.query(
+                `SELECT id FROM messages WHERE conversation_id = $1 AND external_id = $2 LIMIT 1`,
+                [conversationId, externalId]
+              );
+              insertedMessageId = row.rows[0]?.id || null;
+            }
+          } catch (dbErr: any) {
+            logger.warn({ error: dbErr.message, conversationId }, "Failed persisting customer message to DB");
+          }
+        }
+
+        // 4. Persist attachments to message_attachments table
+        if (insertedMessageId && attachments.length > 0) {
+          for (const att of attachments) {
+            try {
+              await pool.query(
+                `INSERT INTO message_attachments (message_id, file_url, thumbnail_url, file_name, file_type, file_size, storage_key, attachment_status, metadata, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'READY', $8, NOW())`,
+                [
+                  insertedMessageId,
+                  att.fileUrl,
+                  att.fileUrl,
+                  att.fileName || 'attachment',
+                  att.fileType || (att.fileUrl.match(/\.(png|jpg|jpeg|webp|gif)/i) ? 'image/jpeg' : 'application/octet-stream'),
+                  att.fileSize || 0,
+                  att.storageKey || null,
+                  JSON.stringify({})
+                ]
+              );
+            } catch (attErr: any) {
+              logger.error({ error: attErr.message, messageId: insertedMessageId }, "Failed persisting message attachment");
+            }
+          }
+        }
+
+        // 5. Prepare customer message payload for real-time room broadcast
+        const recipientRoom = `recipient:${channelRef}`;
+        const clientMsgPayload = {
+          event: "message",
+          data: {
+            id: insertedMessageId ? String(insertedMessageId) : externalId,
+            externalId,
+            role: "customer",
+            content: messageText,
+            createdAt: receivedAtStr,
+            attachments
+          }
+        };
+
+        // Broadcast to customer rooms (conversation + recipient) exactly once per socket
+        broadcastToRooms([room, recipientRoom], clientMsgPayload, socket);
+
+        // 6. If human takeover is active: notify operator in console and DO NOT enqueue to BullMQ / PromptX!
+        if (isHumanTakeover) {
+          try {
+            const projectRes = await pool.query(`SELECT project_id FROM conversations WHERE id = $1`, [conversationId]);
+            const convProjId = String(projectRes.rows[0]?.project_id || projectId || "");
+            if (convProjId) {
+              adminSocketRegistry.broadcastToProject(convProjId, JSON.stringify({
+                event: "NEW_MESSAGE",
+                data: {
+                  conversationId: String(conversationId),
+                  projectId: convProjId,
+                  channel: "WebChat",
+                  messageType
+                }
+              }));
+            }
+          } catch (adminErr: any) {
+            logger.warn({ error: adminErr.message, conversationId }, "Failed notifying admin sockets of customer takeover message");
+          }
+          return;
+        }
+
+        // 7. Normal AI mode: delegate to background queue immediately (maxRetry: 0 to prevent duplicate flow runs)
         const inboundMsg = {
           senderId: channelRef,
           channel: "WebChat" as const,
-          text: parsed.data.text,
+          text: messageText,
           receivedAt: receivedAtStr,
-          companyId
+          companyId,
+          attachments,
+          conversationId: String(conversationId),
+          externalId,
+          tempId: externalId,
+          messageId: insertedMessageId
         };
 
-        // Delegate to background queue immediately (maxRetry: 0 to prevent duplicate flow runs)
         const jobQueue = QueueFactory.getQueue();
         const requestId = randomUUID();
         await jobQueue.enqueue({
@@ -939,17 +1144,6 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
           },
           maxRetry: 0
         });
-
-        // Broadcast back to current room to sync other user tabs
-        broadcastToRoom(room, {
-          event: "message",
-          data: {
-            id: randomUUID(),
-            role: "customer",
-            content: parsed.data.text,
-            createdAt: receivedAtStr
-          }
-        }, socket);
 
       } catch (err: any) {
         logger.error({ error: err.message }, "Error processing socket message");
@@ -1028,19 +1222,51 @@ export default async function WebChatGateway(fastify: FastifyInstance) {
 }
 
 /**
+ * Broadcasts a message to all open WebSockets across multiple rooms (deduplicated by socket instance).
+ * Skips the optional skipSocket parameter to avoid echoing.
+ * Also deduplicates by message id per socket using a bounded Set to eliminate duplicate delivery.
+ */
+export function broadcastToRooms(rooms: string[], payload: any, skipSocket?: any) {
+  const targetSockets = new Set<any>();
+  for (const room of rooms) {
+    if (!room) continue;
+    const sockets = activeConnections.get(room);
+    if (sockets) {
+      for (const s of sockets) {
+        if (s !== skipSocket && s.readyState === 1) { // 1 = OPEN
+          targetSockets.add(s);
+        }
+      }
+    }
+  }
+
+  const payloadStr = JSON.stringify(payload);
+  const msgId = payload?.data?.id || payload?.id;
+
+  for (const socket of targetSockets) {
+    if (msgId) {
+      if (!socket._deliveredMessageIds) {
+        socket._deliveredMessageIds = new Set<string>();
+      }
+      if (socket._deliveredMessageIds.has(msgId)) {
+        continue;
+      }
+      socket._deliveredMessageIds.add(msgId);
+      if (socket._deliveredMessageIds.size > 1000) {
+        const first = socket._deliveredMessageIds.values().next().value;
+        if (first) socket._deliveredMessageIds.delete(first);
+      }
+    }
+    socket.send(payloadStr);
+  }
+}
+
+/**
  * Broadcasts a message to all open WebSockets in a conversation room.
  * Skips the optional skipSocket parameter to avoid echoing.
  */
 function broadcastToRoom(room: string, payload: any, skipSocket?: any) {
-  const sockets = activeConnections.get(room);
-  if (!sockets) return;
-
-  const payloadStr = JSON.stringify(payload);
-  for (const socket of sockets) {
-    if (socket !== skipSocket && socket.readyState === 1) { // 1 = OPEN
-      socket.send(payloadStr);
-    }
-  }
+  broadcastToRooms([room], payload, skipSocket);
 }
 
 /**
@@ -1070,10 +1296,13 @@ export function broadcastWebChatOutbound(payload: {
     }
   };
 
+  const targetRooms: string[] = [];
   if (payload.conversationId) {
-    broadcastToRoom(`conversation:${payload.conversationId}`, msgPayload);
+    targetRooms.push(`conversation:${payload.conversationId}`);
   }
   if (payload.recipientId) {
-    broadcastToRoom(`recipient:${payload.recipientId}`, msgPayload);
+    targetRooms.push(`recipient:${payload.recipientId}`);
   }
+
+  broadcastToRooms(targetRooms, msgPayload);
 }

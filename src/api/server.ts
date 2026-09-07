@@ -75,6 +75,8 @@ import {
 import { executionContextService } from "../domain/execution/ExecutionContextService";
 import { traceRecorder } from "../observability/TraceRecorder";
 import { adminSocketRegistry } from "./AdminSocketRegistry";
+import { JwtUtil } from "../shared/jwt";
+import { getWebchatJwtSecret } from "../middleware/customerAuth";
 import { webhookSignatureHook } from "../middleware/webhookSignature";
 import { rateLimitHook } from "../middleware/rateLimit";
 import { SmsNotificationService } from "../services/SmsNotificationService";
@@ -115,6 +117,22 @@ fastify.addContentTypeParser("application/json", { parseAs: "buffer" }, (request
     done(error, undefined);
   }
 });
+
+// Support raw binary buffers for direct file uploads (images, pdf, octet-stream)
+fastify.addContentTypeParser(
+  [
+    "application/octet-stream",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "application/pdf",
+  ],
+  { parseAs: "buffer" },
+  (request, body, done) => {
+    done(null, body);
+  }
+);
 fastify.register(websocketPlugin);
 fastify.register(tenantPlugin);
 /**
@@ -143,22 +161,34 @@ if (redisPub) {
   );
 }
 
-/** Publishes to Redis for multi-instance clusters and performs direct in-memory broadcast for local sockets. */
+/** Publishes to Redis for multi-instance clusters, falling back to direct in-memory broadcast only when Redis is unavailable. */
 async function publishOutbound(channel: string, payload: string): Promise<void> {
+  let parsed: any = null;
   try {
-    const parsed = JSON.parse(payload);
-    broadcastWebChatOutbound(parsed);
-  } catch (err: any) {
-    serverLogger.warn({ error: err.message }, "Direct in-memory broadcast error");
+    parsed = JSON.parse(payload);
+    if (!parsed.id) {
+      parsed.id = randomUUID();
+      payload = JSON.stringify(parsed);
+    }
+  } catch {}
+
+  let publishedToRedis = false;
+  if (redisPub) {
+    try {
+      await redisPub.publish(channel, payload);
+      publishedToRedis = true;
+    } catch (err: any) {
+      serverLogger.warn({ error: err.message, channel }, "Failed to publish outbound event to Redis; falling back to direct broadcast");
+    }
   }
 
-  if (!redisPub) return;
-  try {
-    await redisPub.publish(channel, payload);
-  } catch (err: any) {
-    // Delivery over Redis is best-effort: the message is already persisted,
-    // and failing here must not abort the caller's request.
-    serverLogger.warn({ error: err.message, channel }, "Failed to publish outbound event to Redis");
+  // If Redis is not configured or publish failed, perform in-memory broadcast
+  if (!publishedToRedis && parsed) {
+    try {
+      broadcastWebChatOutbound(parsed);
+    } catch (err: any) {
+      serverLogger.warn({ error: err.message }, "Direct in-memory broadcast error");
+    }
   }
 }
 
@@ -215,8 +245,9 @@ async function requestHumanTakeover(input: {
   reasonCode?: string;
   reasonDetail?: string;
   source?: string;
+  recipientId?: string;
 }) {
-  const { conversationId, role, content, reasonCode, reasonDetail, source } = input;
+  const { conversationId, role, content, reasonCode, reasonDetail, source, recipientId } = input;
 
   // Ordered deliberately. Everything before the broadcast delays the operator's
   // alert, so only two things are allowed to precede it: the lease that stops
@@ -306,20 +337,16 @@ async function requestHumanTakeover(input: {
       serverLogger.warn({ error: err.message, conversationId }, "Takeover backup mirror failed");
     }
 
-    if (content) {
+    // Never persist sentinel strings into messages table
+    if (content && content.trim().toLowerCase() !== "handled_by_human") {
       try {
         const messageRole = role || "customer";
-        // Bounded duplicate check. The previous form loaded every message in
-        // the conversation and compared content across the whole history, so
-        // it grew without limit and silently dropped any legitimate repeat of
-        // an earlier sentence. Adapters without the bounded query fall back to
-        // the same comparison over the most recent messages only.
         let alreadyStored = false;
         if (typeof (dbAdapter as any).hasRecentMessage === "function") {
           alreadyStored = await (dbAdapter as any).hasRecentMessage(conversationId, messageRole, content, 5);
         } else {
           const recent = (await dbAdapter.getMessages(conversationId)).slice(-5);
-          alreadyStored = recent.some((m: any) => m.content === content && m.role === messageRole);
+          alreadyStored = recent.some((m: any) => m.content === content);
         }
         if (!alreadyStored) {
           await dbAdapter.saveMessage(conversationId, messageRole, content);
@@ -333,11 +360,21 @@ async function requestHumanTakeover(input: {
       "webchat:outbound",
       JSON.stringify({
         conversationId,
-        recipientId: "admin",
+        recipientId: recipientId || undefined,
         channel: "WebChat",
-        event: "takeover_change",
+        event: "takeover_started",
+        data: {
+          conversation_id: String(conversationId),
+          conversationId: String(conversationId),
+          state: "PENDING_HUMAN",
+          status: "PENDING_HUMAN",
+          reason: reasonCode || "ai_escalation",
+          reasonCode: reasonCode || "CUSTOMER_REQUESTED_HUMAN"
+        },
         status: "PENDING_HUMAN",
+        state: "PENDING_HUMAN",
         reasonCode: reasonCode || "CUSTOMER_REQUESTED_HUMAN",
+        sentAt: new Date().toISOString()
       })
     );
 
@@ -578,52 +615,111 @@ async function bootstrap() {
         // anyone who really is in project 1.
         let convProjectId = "1";
         let convOrgId = "org_default";
+        let resolvedSenderRef = job.data.senderId;
+        let resolvedConvId: string | null = null;
         try {
-          const identRef = job.data.senderId;
-          if (identRef) {
+          const targetConvIdNum = job.data.conversationId ? parseInt(String(job.data.conversationId), 10) : 0;
+          if (targetConvIdNum > 0) {
             const convRes = await pool.query(
-              `SELECT c.project_id, p.org_id
+              `SELECT c.id, c.project_id, p.org_id, i.channel_ref
                FROM conversations c
                JOIN identities i ON i.id = c.identity_id
                LEFT JOIN projects p ON p.id = c.project_id
-               WHERE (i.channel_ref = $1 OR i.channel_ref = 'cust_' || $1)
-                 AND LOWER(c.channel) = 'webchat' AND c.status = 'open'
-               ORDER BY c.id DESC LIMIT 1`,
-              [identRef]
+               WHERE c.id = $1 AND c.status = 'open'
+               LIMIT 1`,
+              [targetConvIdNum]
             );
-            if (convRes.rows.length > 0 && convRes.rows[0].project_id) {
-              convProjectId = String(convRes.rows[0].project_id);
+            if (convRes.rows.length > 0) {
+              resolvedConvId = String(convRes.rows[0].id);
+              if (convRes.rows[0].project_id) convProjectId = String(convRes.rows[0].project_id);
               if (convRes.rows[0].org_id) convOrgId = String(convRes.rows[0].org_id);
+              if (convRes.rows[0].channel_ref) resolvedSenderRef = convRes.rows[0].channel_ref;
+            }
+          }
+
+          if (!resolvedConvId) {
+            const identRef = job.data.senderId;
+            if (identRef) {
+              const convRes = await pool.query(
+                `SELECT c.id, c.project_id, p.org_id, i.channel_ref
+                 FROM conversations c
+                 JOIN identities i ON i.id = c.identity_id
+                 LEFT JOIN projects p ON p.id = c.project_id
+                 WHERE (i.channel_ref = $1 OR i.channel_ref = 'cust_' || $1 OR i.id::text = $1)
+                   AND LOWER(c.channel) = 'webchat' AND c.status = 'open'
+                 ORDER BY (CASE WHEN c.project_id IS NOT NULL THEN 0 ELSE 1 END), c.id DESC LIMIT 1`,
+                [identRef]
+              );
+              if (convRes.rows.length > 0) {
+                resolvedConvId = String(convRes.rows[0].id);
+                if (convRes.rows[0].project_id) convProjectId = String(convRes.rows[0].project_id);
+                if (convRes.rows[0].org_id) convOrgId = String(convRes.rows[0].org_id);
+                if (convRes.rows[0].channel_ref) resolvedSenderRef = convRes.rows[0].channel_ref;
+              }
             }
           }
         } catch (lookupErr: any) {
-          // A failed lookup must not drop the message: fall through on the
-          // legacy literals and let the flow answer.
-          serverLogger.warn({ error: lookupErr.message }, "[BullMQ Worker] WebChat project lookup failed; using defaults");
+          serverLogger.warn({ error: lookupErr.message }, "[BullMQ Worker] WebChat project lookup failed");
+        }
+
+        // Rule 3: Fail-Closed Context.
+        // If projectId is missing or unverified, FAIL CLOSED: prompt customer for join code. NEVER fall back to project '1' or 'org_default'.
+        if (!convProjectId || convProjectId === "1" || convProjectId === "undefined" || convProjectId === "null") {
+          serverLogger.warn({ conversationId: resolvedConvId, senderRef: resolvedSenderRef }, "[BullMQ Worker] Customer has no verified project context; failing closed");
+          const promptJoinText = "กรุณาระบุรหัสโครงการ (Join Code) เพื่อเข้าใช้งานระบบค่ะ";
+          const targetConv = resolvedConvId || (job.data.conversationId ? String(job.data.conversationId) : null);
+          if (targetConv) {
+            await pool.query(
+              `INSERT INTO messages (conversation_id, role, content, message_type, created_at)
+               VALUES ($1, 'ai', $2, 'text', NOW())`,
+              [parseInt(targetConv, 10), promptJoinText]
+            );
+            await publishOutbound(
+              "webchat:outbound",
+              JSON.stringify({
+                conversationId: targetConv,
+                recipientId: resolvedSenderRef,
+                channel: "WebChat",
+                text: promptJoinText,
+                sentAt: new Date().toISOString()
+              })
+            );
+          }
+          return { text: promptJoinText, recipientId: resolvedSenderRef, channel: "WebChat" };
         }
 
         // Ensure local conversation and identity exist first for the stable customer identity
-        const localConvId = await memoryService.ensureConversation(job.data.senderId, convProjectId, "WebChat");
-        serverLogger.info(`[BullMQ Worker] Ensured local conversation (ID: ${localConvId}) for customer: ${job.data.senderId} in Project: ${convProjectId}`);
+        const localConvId = resolvedConvId || await memoryService.ensureConversation(resolvedSenderRef, convProjectId, "WebChat");
+        serverLogger.info(`[BullMQ Worker] Ensured local conversation (ID: ${localConvId}) for customer: ${resolvedSenderRef} in Project: ${convProjectId}`);
 
-        // WebChat talks to the same PromptX flow layer LINE does (LINE goes via
-        // LINE_DM_GATEWAY_WEBHOOK_URL in AgentSessionQueueWorker). It is
-        // deliberately NOT routed through the local Orchestrator: that path ends
-        // at PromptXMcpClient.chatAgent(), which calls a remote MCP tool named
-        // "chat" that this PromptX project does not expose — the customer saw
-        // "MCP error -32602: Tool chat not found" for every message. See
-        // ISSUE-051.
         serverLogger.info(`[BullMQ Worker] Forwarding WebChat message to PromptX Flow: ${webhookUrl}`);
 
-        const response = await axios.post(webhookUrl, {
+        const promptxPayload: any = {
           channel: "webchat",
-          customer_ref: job.data.senderId,
+          customer_ref: resolvedSenderRef,
           message: job.data.text,
           project_id: convProjectId,
           org_id: convOrgId,
           destination: "default",
+          external_id: job.data.externalId || job.data.tempId,
+          message_id: job.data.messageId,
+          temp_id: job.data.tempId || job.data.externalId,
           received_at: new Date().toISOString()
-        }, { timeout: 180000 });
+        };
+
+        // Forward attachment metadata and image URL if present
+        if (job.data.attachments && Array.isArray(job.data.attachments) && job.data.attachments.length > 0) {
+          promptxPayload.attachments = job.data.attachments;
+          const firstImg = job.data.attachments.find((a: any) =>
+            a.fileType?.startsWith("image/") || (a.fileUrl && /\.(jpeg|jpg|png|webp|gif)/i.test(a.fileUrl))
+          );
+          if (firstImg) {
+            promptxPayload.image_url = firstImg.fileUrl;
+            promptxPayload.file_url = firstImg.fileUrl;
+          }
+        }
+
+        const response = await axios.post(webhookUrl, promptxPayload, { timeout: 180000 });
 
         const data = response.data || {};
         const replyText = String(
@@ -635,26 +731,85 @@ async function bootstrap() {
           data.data?.reply_text ||
           ""
         );
-        const suppressReply = data.suppress_reply === true || replyText.trim().length === 0;
         const convId = data.conversation_id || data.body?.conversation_id;
+        const targetConvId = resolvedConvId || (convId ? String(convId) : null) || localConvId;
+
+        const takeoverStatus = String(
+          data.takeover_status ||
+          data.body?.takeover_status ||
+          data.status ||
+          data.body?.status ||
+          ""
+        ).trim().toUpperCase();
+
+        const normalizedReplyText = replyText.trim().toLowerCase();
+
+        // Rule 5 & 6: Handle "handled_by_human" / escalation sentinel
+        const isHandledByHuman =
+          normalizedReplyText === "handled_by_human" ||
+          takeoverStatus === "PENDING_HUMAN" ||
+          takeoverStatus === "ACTIVE_HUMAN" ||
+          takeoverStatus === "HANDLED_BY_HUMAN" ||
+          takeoverStatus === "HUMAN" ||
+          data.action === "handled_by_human" ||
+          data.handled_by === "human";
+
+        if (isHandledByHuman) {
+          serverLogger.info({ convId: targetConvId, takeoverStatus, replyText }, "[BullMQ Worker] PromptX signaled handled_by_human/escalation; triggering human takeover");
+
+          // 1. MUST NOT insert as AI message in messages table!
+          // 2. Trigger human takeover (sets PENDING_HUMAN, alerts operator, and broadcasts canonical takeover_started event once)
+          try {
+            await requestHumanTakeover({
+              conversationId: String(targetConvId),
+              role: "customer",
+              content: job.data.text || "[Customer requested assistance]",
+              reasonCode: "AI_ESCALATED_HUMAN",
+              reasonDetail: "PromptX flow escalated to human",
+              source: "workflow",
+              recipientId: resolvedSenderRef
+            });
+          } catch (takeoverErr: any) {
+            serverLogger.error({ error: takeoverErr.message, convId: targetConvId }, "[BullMQ Worker] Failed requesting human takeover");
+          }
+
+          return { status: "handled_by_human", recipientId: resolvedSenderRef, channel: "WebChat", suppressReply: true };
+        }
+
+        const suppressReply = data.suppress_reply === true || replyText.trim().length === 0;
 
         serverLogger.info(`[BullMQ Worker] Received sync reply from PromptX Flow: "${replyText}" (convId: ${convId})`);
 
-        if (!suppressReply) {
-          const sessionContext = await memoryService.loadSessionContext(job.data.senderId, "WebChat");
-          await publishOutbound(
-            "webchat:outbound",
-            JSON.stringify({
-              conversationId: convId || sessionContext.conversationId || localConvId,
-              recipientId: job.data.senderId,
-              channel: "WebChat",
-              text: replyText,
-              sentAt: new Date().toISOString()
-            })
-          );
+        if (!suppressReply && replyText.trim().length > 0) {
+          // Ensure AI reply is persisted into messages table if PromptX flow didn't already insert it
+          try {
+            const existing = await pool.query(
+              `SELECT id FROM messages WHERE conversation_id = $1 AND role = 'ai' AND content = $2 AND created_at > NOW() - INTERVAL '1 minute' LIMIT 1`,
+              [parseInt(targetConvId, 10), replyText]
+            );
+            if (existing.rows.length === 0) {
+              await pool.query(
+                `INSERT INTO messages (conversation_id, role, content, message_type, created_at)
+                 VALUES ($1, 'ai', $2, 'text', NOW())`,
+                [parseInt(targetConvId, 10), replyText]
+              );
+            }
+          } catch (insertErr: any) {
+            serverLogger.warn({ error: insertErr.message }, "[BullMQ Worker] Failed ensuring AI message insertion in DB");
+          }
+
+          const outboundPayload = {
+            conversationId: targetConvId,
+            recipientId: resolvedSenderRef,
+            channel: "WebChat",
+            text: replyText,
+            sentAt: new Date().toISOString()
+          };
+          // Broadcast single outbound payload
+          await publishOutbound("webchat:outbound", JSON.stringify(outboundPayload));
         }
 
-        return { text: replyText, recipientId: job.data.senderId, channel: "WebChat", suppressReply };
+        return { text: replyText, recipientId: resolvedSenderRef, channel: "WebChat", suppressReply };
       } catch (err: any) {
         const responseData = err.response?.data;
         serverLogger.error({ error: err.message, responseData }, "[BullMQ Worker] Failed calling PromptX Flow webhook");
@@ -816,8 +971,46 @@ fastify.get("/api/v1/media/file", async (request, reply) => {
 
     const { S3MediaStorageService } = await import("../media/services/S3MediaStorageService");
     const mediaService = new S3MediaStorageService({});
-    const { buffer, mimeType } = await mediaService.download(storageKey);
 
+    // Enforce HMAC signature check or authorized session
+    const { expires, signature } = query;
+    if (signature && expires) {
+      const isValid = mediaService.verifyPresignedUrl(storageKey, expires, signature);
+      if (!isValid) {
+        return reply.code(403).send({ error: "Forbidden", message: "Invalid or expired media signature" });
+      }
+    } else {
+      // Check for valid Authorization header or session cookie
+      const authHeader = request.headers.authorization;
+      const sessionCookie = (request.headers.cookie || "").match(/webchat_session=([^;]+)/);
+      let isAuthorized = false;
+
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        try {
+          const token = authHeader.slice(7).trim();
+          JwtUtil.verify(token, config.SESSION_SECRET || getWebchatJwtSecret());
+          isAuthorized = true;
+        } catch {
+          try {
+            JwtUtil.verify(authHeader.slice(7).trim(), getWebchatJwtSecret());
+            isAuthorized = true;
+          } catch {}
+        }
+      }
+
+      if (!isAuthorized && sessionCookie) {
+        try {
+          JwtUtil.verify(sessionCookie[1], getWebchatJwtSecret());
+          isAuthorized = true;
+        } catch {}
+      }
+
+      if (!isAuthorized) {
+        return reply.code(403).send({ error: "Forbidden", message: "Valid signature or authorized session required" });
+      }
+    }
+
+    const { buffer, mimeType } = await mediaService.download(storageKey);
     return reply.type(mimeType).send(buffer);
   } catch (err: any) {
     return reply.code(404).send({ error: "Media file not found", details: err.message });
@@ -2427,7 +2620,7 @@ fastify.post("/api/v1/internal/sessions/resolve", async (request, reply) => {
   }
   const payload = body.data ? (body.data.data ? body.data.data : body.data) : (body.body ? (body.body.data ? body.body.data : body.body) : body);
 
-  const senderId = payload.senderId || payload.sender_ref || payload.customer_ref;
+  const senderId = payload.senderId || payload.sender_ref || payload.customer_ref || payload.channel_ref || payload.channelRef;
   const channel = payload.channel || "LINE";
   const rawText = payload.messageText 
     || payload.message_text 
@@ -2545,34 +2738,92 @@ fastify.post("/api/v1/internal/sessions/resolve", async (request, reply) => {
     // Save or update customer message in DB if not created yet by gateway
     let currentMsgRecord: any = null;
     if (conversationId) {
-      // Resolve reply_to_message_id from quotedMessageId (LINE reply feature)
-      let replyToMessageId: number | undefined = undefined;
-      if (quotedMessageId) {
+      const incomingMessageId = payload.messageId || payload.message_id || body.message_id || body.messageId || null;
+      const incomingExternalId = externalId || payload.tempId || payload.temp_id || body.tempId || body.temp_id || null;
+
+      // Check if message was already persisted (e.g. by WebChatGateway or LINE webhook)
+      if (incomingMessageId) {
         try {
-          const quotedRes = await pool.query(
-            `SELECT id FROM messages WHERE external_id = $1 ORDER BY id DESC LIMIT 1`,
-            [quotedMessageId]
+          const res = await pool.query(
+            `SELECT * FROM messages WHERE id = $1 AND conversation_id = $2 LIMIT 1`,
+            [parseInt(String(incomingMessageId), 10), conversationId]
           );
-          if (quotedRes.rows.length > 0) {
-            replyToMessageId = parseInt(String(quotedRes.rows[0].id), 10) || undefined;
-            serverLogger.info({ quotedMessageId, replyToMessageId }, "[Webhook] Resolved quotedMessageId -> reply_to_message_id");
-          } else {
-            serverLogger.warn({ quotedMessageId }, "[Webhook] Could not find parent message for quotedMessageId");
+          if (res.rows.length > 0) {
+            currentMsgRecord = res.rows[0];
+            serverLogger.info({ messageId: currentMsgRecord.id, conversationId }, "[sessions/resolve] Reusing existing message by message_id");
           }
         } catch (e: any) {
-          serverLogger.warn({ quotedMessageId, err: e.message }, "[Webhook] Failed to resolve quotedMessageId");
+          serverLogger.warn({ err: e.message }, "[sessions/resolve] Error querying existing message by message_id");
         }
       }
 
-      currentMsgRecord = await dbAdapter.saveMessage(
-        conversationId,
-        "customer",
-        messageText,
-        externalId || undefined,
-        messageType,
-        replyToMessageId,
-        quote_token || undefined
-      );
+      if (!currentMsgRecord && incomingExternalId) {
+        try {
+          const res = await pool.query(
+            `SELECT * FROM messages WHERE conversation_id = $1 AND external_id = $2 LIMIT 1`,
+            [conversationId, String(incomingExternalId)]
+          );
+          if (res.rows.length > 0) {
+            currentMsgRecord = res.rows[0];
+            serverLogger.info({ messageId: currentMsgRecord.id, externalId: incomingExternalId, conversationId }, "[sessions/resolve] Reusing existing message by external_id");
+          }
+        } catch (e: any) {
+          serverLogger.warn({ err: e.message }, "[sessions/resolve] Error querying existing message by external_id");
+        }
+      }
+
+      // For WebChat channel, WebChatGateway owns customer message persistence.
+      // If a customer message was already persisted in this conversation recently, reuse it and NEVER insert a duplicate.
+      if (!currentMsgRecord && (channel.toLowerCase() === "webchat" || channel.toLowerCase() === "web")) {
+        try {
+          const res = await pool.query(
+            `SELECT * FROM messages 
+             WHERE conversation_id = $1 
+               AND role = 'customer' 
+               AND created_at > NOW() - INTERVAL '5 minutes'
+             ORDER BY id DESC LIMIT 1`,
+            [conversationId]
+          );
+          if (res.rows.length > 0) {
+            currentMsgRecord = res.rows[0];
+            serverLogger.info({ messageId: currentMsgRecord.id, conversationId }, "[sessions/resolve] WebChat customer message already persisted by Gateway; skipping duplicate insert");
+          }
+        } catch (e: any) {
+          serverLogger.warn({ err: e.message }, "[sessions/resolve] Error querying recent WebChat customer message");
+        }
+      }
+
+      // Only if NO existing message record exists: persist new customer message
+      if (!currentMsgRecord) {
+        // Resolve reply_to_message_id from quotedMessageId (LINE reply feature)
+        let replyToMessageId: number | undefined = undefined;
+        if (quotedMessageId) {
+          try {
+            const quotedRes = await pool.query(
+              `SELECT id FROM messages WHERE external_id = $1 ORDER BY id DESC LIMIT 1`,
+              [quotedMessageId]
+            );
+            if (quotedRes.rows.length > 0) {
+              replyToMessageId = parseInt(String(quotedRes.rows[0].id), 10) || undefined;
+              serverLogger.info({ quotedMessageId, replyToMessageId }, "[Webhook] Resolved quotedMessageId -> reply_to_message_id");
+            } else {
+              serverLogger.warn({ quotedMessageId }, "[Webhook] Could not find parent message for quotedMessageId");
+            }
+          } catch (e: any) {
+            serverLogger.warn({ quotedMessageId, err: e.message }, "[Webhook] Failed to resolve quotedMessageId");
+          }
+        }
+
+        currentMsgRecord = await dbAdapter.saveMessage(
+          conversationId,
+          "customer",
+          messageText,
+          incomingExternalId || undefined,
+          messageType,
+          replyToMessageId,
+          quote_token || undefined
+        );
+      }
     }
 
     // Auto-ingest LINE image if imageId is provided or messageType is image
