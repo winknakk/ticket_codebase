@@ -26,6 +26,7 @@ import {
 import { LineMessageBatchingService } from "../../services/LineMessageBatchingService";
 import { AgentSessionQueueService } from "../../services/AgentSessionQueueService";
 import { AgentSessionQueueWorker } from "../../services/AgentSessionQueueWorker";
+import { LineTypingIndicatorService } from "../../services/LineTypingIndicatorService";
 
 const logger = createLogger("line-webhook");
 
@@ -167,33 +168,23 @@ async function sendLinePushMessages(
  * Failure stays non-fatal — this is a UX affordance, not part of the reply —
  * but it is now logged rather than swallowed.
  */
-async function showLineLoadingAnimation(userId: string, seconds = 5): Promise<void> {
-  if (!userId || !config.LINE_CHANNEL_ACCESS_TOKEN) return;
-  const loadingSeconds = Math.min(60, Math.max(5, Math.round(seconds / 5) * 5));
-  try {
-    await axios.post(
-      "https://api.line.me/v2/bot/chat/loading/start",
-      { chatId: userId, loadingSeconds },
-      {
-        headers: {
-          Authorization: `Bearer ${config.LINE_CHANNEL_ACCESS_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 3000,
-        httpsAgent: lineHttpsAgent,
-      }
-    );
-  } catch (err: any) {
-    logger.warn(
-      {
-        status: err.response?.status,
-        data: err.response?.data,
-        message: err.message,
-        loadingSeconds,
-      },
-      "LINE loading animation rejected"
-    );
+/**
+ * Single implementation lives in LineTypingIndicatorService (shared with the
+ * agent session worker, which keeps the indicator alive for the whole AI
+ * turn). The route falls back to its own instance when the server does not
+ * inject one, so tests that register the routes alone still work.
+ */
+let typingIndicator: LineTypingIndicatorService | null = null;
+
+function getTypingIndicator(): LineTypingIndicatorService {
+  if (!typingIndicator) {
+    typingIndicator = new LineTypingIndicatorService(pool, config.LINE_CHANNEL_ACCESS_TOKEN || "");
   }
+  return typingIndicator;
+}
+
+async function showLineLoadingAnimation(userId: string, seconds = 5): Promise<void> {
+  await getTypingIndicator().show(userId, seconds);
 }
 
 async function forwardPromptXWebhook(
@@ -315,8 +306,10 @@ export function registerLineWebhookRoutes(
   onboardingService: LineProjectOnboardingService,
   batchingService: LineMessageBatchingService,
   queueService?: AgentSessionQueueService,
-  queueWorker?: AgentSessionQueueWorker
+  queueWorker?: AgentSessionQueueWorker,
+  injectedTypingIndicator?: LineTypingIndicatorService
 ): void {
+  if (injectedTypingIndicator) typingIndicator = injectedTypingIndicator;
   fastify.get("/api/v1/media/line-onboarding/cards/:filename", async (request, reply) => {
     const filename = String((request.params as any).filename || "");
     if (!LINE_ONBOARDING_CARDS.some((card) => card.fileName === filename)) {
@@ -417,6 +410,43 @@ export function registerLineWebhookRoutes(
         try {
           if (decision.action === "REPLY") {
             const replyStartedAt = process.hrtime.bigint();
+
+            // "ปิดเคส" carousel card (two-step close, 2026-09-07): the same
+            // deterministic handler that answers the typed word decides what
+            // to say — no open case → "ไม่มีเคสที่เปิดอยู่", one case → the close
+            // question with chips, several → the list. It pushes its own
+            // message, so the canned prompt below is only the fallback when
+            // the handler could not act.
+            let menuCloseHandled = false;
+            if (decision.reason === "close_case_prompt" && decision.conversationId) {
+              try {
+                const outcome = await customerConfirmationHandler.handle({
+                  conversationId: Number(decision.conversationId),
+                  text: "ปิดเคส",
+                  correlationId: webhookEventId,
+                });
+                menuCloseHandled = outcome.handled;
+                if (outcome.handled) {
+                  await pool.query(
+                    `INSERT INTO messages (conversation_id, role, content, message_type, external_id, created_at)
+                     VALUES ($1, 'customer', $2, 'text', $3, NOW())
+                     ON CONFLICT (conversation_id, external_id) DO NOTHING`,
+                    [decision.conversationId, "ปิดเคส", `${webhookEventId}:menu_tap`]
+                  ).catch(() => {});
+                  logger.info(
+                    { webhookEventId, conversationId: decision.conversationId, reason: outcome.reason, ticketId: outcome.ticketId },
+                    "Close-menu tap answered by the confirmation handler"
+                  );
+                }
+              } catch (menuErr: any) {
+                logger.error({ error: menuErr.message, webhookEventId }, "Close-menu handler failed; falling back to the canned prompt");
+              }
+            }
+            if (menuCloseHandled) {
+              processed += 1;
+              continue;
+            }
+
             await sendLineReply(String(event.replyToken || ""), decision);
             // The close-menu exchange must reach the AI's conversation history:
             // the gate can only route the customer's follow-up ("TCK-... ครับ")
@@ -923,6 +953,7 @@ export function registerLineWebhookRoutes(
                 /(?:ยืนยัน|ถูกต้อง|ถูกแล้ว|ใช่เลย|โอเค|ได้เลย|เปิดเคสเลย|จัดไป|ตามนั้น|ส่งรูป|นี่รูป|รูปปัญหา|ภาพปัญหา|แนบรูป|ยกเลิก|cancel|ไม่เอาแล้ว|ไม่ต้องแล้ว|ไม่แจ้งแล้ว|ช่างมัน|แก้ได้แล้ว|ทำได้แล้ว|รีเซ็ต|reset|พิมพ์ผิด|เปลี่ยนใจ|ไม่เป็นไรแล้ว|อย่าเพิ่งเปิด)/i.test(msgText) ||
                 /(?:^|\s|[.,!])(?:ใช่|ถูก|โอเค|ok|ได้|ครับ|ค่ะ|คับ|งับ|ฮะ|จ้า|เค|ยกเลิก|ไม่เอา|ไม่ต้อง)/i.test(msgText);
 
+              const ackUserId = event?.source?.userId ? String(event.source.userId) : "";
               void customerNotificationService
                 .send({
                   conversationId: Number(decision.conversationId),
@@ -930,6 +961,17 @@ export function registerLineWebhookRoutes(
                   idempotencyKey: webhookEventId,
                   projectId: decision.projectId ?? null,
                   correlationId: webhookEventId,
+                })
+                .then((ackResult: any) => {
+                  // Phase B of the typing indicator. The ack push just
+                  // dismissed the indicator armed at receipt, and the batch
+                  // debounce (15 s) plus queue hand-off are silent otherwise.
+                  // Re-arm it now; the worker keeps it alive from dispatch
+                  // until the AI reply row lands.
+                  if (ackResult?.sent && ackUserId) {
+                    return showLineLoadingAnimation(ackUserId, 20);
+                  }
+                  return undefined;
                 })
                 .catch((ackErr: any) =>
                   logger.error(

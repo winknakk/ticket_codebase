@@ -40,9 +40,11 @@ import { registerMasterDataRoutes } from "./routes/masterData";
 import { registerAdminPlaneIntegrationRoutes } from "./routes/adminPlaneIntegrationRoutes";
 import { registerPortalRoutes } from "./routes/portal";
 import { registerLineWebhookRoutes } from "./routes/lineWebhook";
+import { registerSlaConsoleRoutes } from "./routes/slaConsole";
 import { LineMessageBatchingService } from "../services/LineMessageBatchingService";
 import { AgentSessionQueueService } from "../services/AgentSessionQueueService";
 import { AgentSessionQueueWorker } from "../services/AgentSessionQueueWorker";
+import { LineTypingIndicatorService } from "../services/LineTypingIndicatorService";
 import { registerGitRepositoryRoutes } from "./routes/gitRepoRoutes";
 import { SLAMatrixService } from "../services/SLAMatrixService";
 import { PolicyEngine } from "../policy/PolicyEngine";
@@ -56,6 +58,7 @@ import { PlaneWebhookService, verifyPlaneWebhookSignature } from "../services/pl
 import { PlaneReverseSyncPoller } from "../services/PlaneReverseSyncPoller";
 import { InactivityTimerService } from "../services/InactivityTimerService";
 import { EmailNotificationService } from "../services/EmailNotificationService";
+import { SLACadenceService } from "../services/SLACadenceService";
 import { CloseTicketInputSchema, RestoreTicketInputSchema } from "../schemas/validation";
 import { AgentManager } from "../agent/AgentRuntime";
 import { Orchestrator } from "../orchestrator/Orchestrator";
@@ -191,6 +194,18 @@ inactivityTimerService.startMonitor();
 const evalTestRunner = new EvalTestRunner(agentManager, dbAdapter);
 const smsNotificationService = new SmsNotificationService(pool);
 const emailNotificationService = new EmailNotificationService();
+// Dev reminders go out through the PromptX notification flow (Gmail), customer
+// progress reports through CustomerNotificationService (LINE). Enabled on one
+// instance only — see SLA_CADENCE_ENABLED.
+const slaCadenceService = new SLACadenceService({
+  lookbackDays: config.SLA_CADENCE_LOOKBACK_DAYS,
+  maxSendsPerRun: config.SLA_CADENCE_MAX_SENDS_PER_RUN,
+});
+if (config.SLA_CADENCE_ENABLED) {
+  slaCadenceService.startMonitor(config.SLA_CADENCE_INTERVAL_MS);
+} else {
+  serverLogger.info("SLA cadence engine disabled (SLA_CADENCE_ENABLED=false)");
+}
 const projectJoinCodePepper =
   config.PROJECT_JOIN_CODE_PEPPER ||
   config.LINE_CHANNEL_ACCESS_TOKEN ||
@@ -2819,11 +2834,16 @@ fastify.register(registerAdminPlaneIntegrationRoutes);
 fastify.register(registerGitRepositoryRoutes);
 registerPortalRoutes(fastify, { dbAdapter, slaService, emailService: emailNotificationService });
 const agentSessionQueueService = new AgentSessionQueueService(pool);
+// Shared by the LINE webhook route (phases A/B: receipt + after the ack) and
+// the queue worker (phase C: kept alive until the AI reply row is observed).
+const lineTypingIndicatorService = new LineTypingIndicatorService(pool, config.LINE_CHANNEL_ACCESS_TOKEN || "");
 const agentSessionQueueWorker = new AgentSessionQueueWorker(agentSessionQueueService, {
   dmGatewayUrl: config.LINE_DM_GATEWAY_WEBHOOK_URL,
   leaseDurationMs: 120000,
   maxAttempts: 2,
   watchdogIntervalMs: 30000,
+  typingIndicator: lineTypingIndicatorService,
+  turnCompletionTimeoutMs: 90000,
 });
 const lineMessageBatchingService = new LineMessageBatchingService(
   {
@@ -2839,8 +2859,11 @@ registerLineWebhookRoutes(
   lineProjectOnboardingService,
   lineMessageBatchingService,
   agentSessionQueueService,
-  agentSessionQueueWorker
+  agentSessionQueueWorker,
+  lineTypingIndicatorService
 );
+// Standalone SLA cadence console (page under the public media prefix, data under /api/v1/admin/sla/*).
+registerSlaConsoleRoutes(fastify, slaCadenceService);
 
 // Flush any in-flight LINE message batches and gracefully stop worker before server closes
 fastify.addHook("onClose", async () => {

@@ -231,7 +231,7 @@ export class TicketAgent implements IAgent {
         conversationId,
         subject: this.buildSubject(text),
         summary: `User reported issue: "${text}" on channel ${message.channel}`,
-        priority: "P3",
+        priority: "Medium",
         severity: "Medium",
         projectId: String(projectId),
         diagnostic,

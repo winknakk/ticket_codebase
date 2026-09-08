@@ -63,4 +63,25 @@ export class EmailNotificationService {
     `;
     return this.sendEmail({ to, subject: `[TicketX] Ticket #${ticketNumber} Resolved`, bodyHtml, tenantCtx });
   }
+
+  /**
+   * Helper to send Urgent email notification to DEV team
+   */
+  async notifyDevTeamUrgent(devEmails: string[], ticketNumber: string, subject: string, summary: string, tenantCtx?: TenantContext) {
+    const bodyHtml = `
+      <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
+        <div style="background-color: #dc2626; color: white; padding: 10px; font-weight: bold; text-align: center;">
+          🔴 URGENT INCIDENT
+        </div>
+        <h2>Ticket #${ticketNumber}</h2>
+        <p><strong>Subject:</strong> ${subject}</p>
+        <p><strong>Summary:</strong> ${summary}</p>
+        <p>Please investigate immediately.</p>
+      </div>
+    `;
+    
+    for (const email of devEmails) {
+      await this.sendEmail({ to: email, subject: `🔴 [URGENT] Ticket #${ticketNumber} - ${subject}`, bodyHtml, tenantCtx });
+    }
+  }
 }

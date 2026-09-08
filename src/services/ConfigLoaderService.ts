@@ -207,6 +207,41 @@ export class ConfigLoaderService {
   }
 
   /**
+   * Retrieves Dev Notification Emails mapped to a specific project.
+   */
+  async getDevNotificationEmails(projectId: string): Promise<string[]> {
+    const cacheKey = `config:project:${projectId}:dev_emails`;
+    const cached = await this.cache.get<string[]>(cacheKey);
+    if (cached) return cached;
+
+    logger.info({ projectId }, "Cache miss: loading project dev notification emails from DB");
+    // projects has a `metadata` JSONB column (there is no `settings` column —
+    // the previous query threw 42703 on every call). The key is a JSON array;
+    // the legacy singular string key is honoured as a fallback.
+    const { rows } = await pool.query(
+      `SELECT metadata->'dev_notification_emails' AS dev_emails,
+              metadata->>'dev_notification_email' AS legacy_email
+       FROM projects
+       WHERE id = $1
+       LIMIT 1`,
+      [projectId]
+    );
+
+    let devEmails: string[] = [];
+    if (rows.length > 0) {
+      const parsed = rows[0].dev_emails;
+      if (Array.isArray(parsed)) {
+        devEmails = parsed.map((v: unknown) => String(v).trim()).filter(Boolean);
+      } else if (rows[0].legacy_email) {
+        devEmails = [String(rows[0].legacy_email).trim()];
+      }
+    }
+
+    await this.cache.set(cacheKey, devEmails, 3600);
+    return devEmails;
+  }
+
+  /**
    * Invalidates all configurations cached for a specific project.
    */
   async invalidateProjectCache(projectId: string): Promise<void> {
@@ -215,5 +250,6 @@ export class ConfigLoaderService {
     await this.cache.delete(`config:project:${projectId}:sla`);
     await this.cache.delete(`config:project:${projectId}:routing`);
     await this.cache.delete(`config:project:${projectId}:ai_settings`);
+    await this.cache.delete(`config:project:${projectId}:dev_emails`);
   }
 }

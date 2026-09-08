@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS tickets (
   running_summary            TEXT,
   last_ai_summary            TEXT,
   status                     VARCHAR(50) NOT NULL DEFAULT 'Open' CHECK (status IN ('Open','In Progress','Resolved','Closed','Duplicate','Cancelled')),
-  priority                   VARCHAR(10) NOT NULL DEFAULT 'P3' CHECK (priority IN ('P1','P2','P3','P4')),
+  priority                   VARCHAR(10) NOT NULL DEFAULT 'Medium' CHECK (priority IN ('Urgent','High','Medium','Low','None')),
   severity                   VARCHAR(20) DEFAULT 'Medium' CHECK (severity IN ('Critical','High','Medium','Low') OR severity IS NULL),
   issue_category             VARCHAR(100),
   created_via                VARCHAR(100) DEFAULT 'AI',

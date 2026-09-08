@@ -1178,8 +1178,8 @@ export async function registerAdminRoutes(fastify: FastifyInstance, deps: AdminR
     // Helper validation functions
     function validateSla(body: any) {
       const { priority, resolve_hours, response_hours, service_window } = body;
-      if (!priority || !/^P[1-5]$/.test(priority)) {
-        throw new Error("Invalid priority: must be P1, P2, P3, P4, or P5");
+      if (!priority || !/^(Urgent|High|Medium|Low|None|P[1-5])$/i.test(priority)) {
+        throw new Error("Invalid priority: must be Urgent, High, Medium, Low, None, or P1-P5");
       }
       if (resolve_hours === undefined || isNaN(parseInt(resolve_hours, 10)) || parseInt(resolve_hours, 10) <= 0 || parseInt(resolve_hours, 10) > 720) {
         throw new Error("Invalid resolve_hours: must be an integer between 1 and 720");

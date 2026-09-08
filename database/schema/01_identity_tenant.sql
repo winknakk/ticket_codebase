@@ -212,7 +212,7 @@ CREATE UNIQUE INDEX idx_project_prompts_one_active ON project_prompts(project_id
 CREATE TABLE IF NOT EXISTS project_sla_policies (
   id            SERIAL PRIMARY KEY,
   project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  priority      VARCHAR(10) NOT NULL CHECK (priority IN ('P1','P2','P3','P4')),
+  priority      VARCHAR(20) NOT NULL CHECK (priority IN ('Urgent','High','Medium','Low','None','P1','P2','P3','P4','P5')),
   response_hours NUMERIC(5,2) NOT NULL,
   resolve_hours  NUMERIC(5,2) NOT NULL,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),

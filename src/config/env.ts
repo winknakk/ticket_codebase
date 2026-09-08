@@ -86,6 +86,34 @@ export const EnvSchema = z.object({
   PLANE_REVERSE_SYNC_ENABLED: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   PLANE_REVERSE_SYNC_INTERVAL_MS: z.coerce.number().int().min(10000).default(30000),
   PLANE_REVERSE_SYNC_BATCH_SIZE: z.coerce.number().int().min(1).max(25).default(25),
+  // SLA cadence engine (dev repeat reminders + customer progress reports).
+  // Off by default: exactly ONE backend instance may run it, or every reminder
+  // fires once per instance. Dev reminders are delivered by the PromptX
+  // "Plane Webhook Notification Flow" (Gmail piece) — the backend only posts
+  // the reminder payload to that flow's webhook URL.
+  SLA_CADENCE_ENABLED: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
+  SLA_CADENCE_INTERVAL_MS: z.coerce.number().int().min(60000).default(900000),
+  SLA_NOTIFICATION_FLOW_WEBHOOK_URL: z.string().url().optional(),
+  // Safety valves: ignore tickets older than the lookback (stale test data)
+  // and cap sends per 15-minute pass so a backlog never floods LINE / Gmail.
+  SLA_CADENCE_LOOKBACK_DAYS: z.coerce.number().int().min(1).max(365).default(14),
+  SLA_CADENCE_MAX_SENDS_PER_RUN: z.coerce.number().int().min(1).max(500).default(25),
+  // Only notify when the cadence slot boundary was crossed this recently.
+  // Without it, enabling the engine fires one message per already-open ticket
+  // at once (measured: 46 customer messages on the first pass against live
+  // data). Keep it above SLA_CADENCE_INTERVAL_MS and well below 1 hour.
+  SLA_CADENCE_CATCHUP_GRACE_MINUTES: z.coerce.number().int().min(1).max(1440).default(30),
+  // Two-step close follow-ups (run by the same cadence engine). A ticket left
+  // in RESOLVED / CUSTOMER_CONFIRMED gets one LINE nudge after N business
+  // days and is closed automatically after M business days; 0 disables.
+  RESOLUTION_NUDGE_BUSINESS_DAYS: z.coerce.number().int().min(0).max(30).default(1),
+  RESOLUTION_AUTO_CLOSE_BUSINESS_DAYS: z.coerce.number().int().min(0).max(60).default(3),
+  // SLA console write controls (shift a ticket's clock, force a test send,
+  // reset test data). Unset = allowed outside production, denied in production.
+  SLA_CONSOLE_ALLOW_WRITES: z.enum(["true", "false"]).optional().transform((value) => (value === undefined ? undefined : value === "true")),
+  // Last-resort recipient when a project has no metadata.dev_notification_emails
+  // and system_constants has no DEV_NOTIFICATION_FALLBACK_EMAIL row.
+  DEV_NOTIFICATION_FALLBACK_EMAIL: z.string().email().default("natapohnagain@gmail.com"),
   DB_POOL_MAX: z.coerce.number().default(10),
   // PostgreSQL is remote (measured ~12 ms per round trip, ~85 ms to open a
   // fresh connection). At 30 s any channel with a gap between messages paid

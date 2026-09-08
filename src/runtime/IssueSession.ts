@@ -41,7 +41,7 @@ export interface TicketState {
   id?: number;
   ticketCode?: string;
   status?: "Open" | "In Progress" | "Resolved" | "Closed" | "Duplicate" | "Cancelled";
-  priority?: "P1" | "P2" | "P3" | "P4";
+  priority?: "Urgent" | "High" | "Medium" | "Low" | "None";
   slaBreached: boolean;
 }
 

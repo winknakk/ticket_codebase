@@ -1054,14 +1054,14 @@ export class PostgresAdapter implements DatabaseAdapter {
       
       const priorities = (row.ticket_priorities || '').split(' ');
       const highestPriority = priorities.reduce((max: string, pri: string) => {
-        const priorityMap: Record<string, number> = { 'P1': 4, 'P2': 3, 'P3': 2, 'P4': 1 };
+        const priorityMap: Record<string, number> = { 'Urgent': 5, 'High': 4, 'Medium': 3, 'Low': 2, 'None': 1, 'P1': 5, 'P2': 4, 'P3': 3, 'P4': 2, 'P5': 1 };
         if ((priorityMap[pri] || 0) > (priorityMap[max] || 0)) {
           return pri;
         }
         return max;
-      }, 'P4');
+      }, 'None');
 
-      const priorityToSeverity: Record<string, string> = { P1: "Critical", P2: "High", P3: "Medium", P4: "Low" };
+      const priorityToSeverity: Record<string, string> = { Urgent: "Critical", High: "High", Medium: "Medium", Low: "Low", None: "None", P1: "Critical", P2: "High", P3: "Medium", P4: "Low", P5: "None" };
       const highestSeverity = priorityToSeverity[highestPriority] || "Low";
 
       return {

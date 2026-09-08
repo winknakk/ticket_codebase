@@ -232,7 +232,7 @@ BEGIN
 
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tickets_priority_check') THEN
     ALTER TABLE tickets ADD CONSTRAINT tickets_priority_check
-      CHECK (priority IN ('P1','P2','P3','P4'));
+      CHECK (priority IN ('Urgent','High','Medium','Low','None'));
   END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tickets_severity_check') THEN

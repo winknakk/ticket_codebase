@@ -571,17 +571,59 @@ export function selectPlaneInProgressState(states: PlaneStateSummary[]): PlaneSt
 export function selectPlaneDoneState(states: PlaneStateSummary[]): PlaneStateSummary | undefined {
   const candidates = states.filter((state) => state.id);
   return (
-    candidates.find((state) => ["done", "completed", "resolved", "closed"].includes(state.name?.trim().toLowerCase() || "")) ||
+    candidates.find((state) => ["done", "completed", "resolved", "closed", "close"].includes(state.name?.trim().toLowerCase() || "")) ||
     candidates.find((state) => state.group?.trim().toLowerCase() === "completed")
   );
 }
 
+/** Exact-name lookup after collapsing spaces/underscores/hyphens. */
+function findPlaneStateByName(states: PlaneStateSummary[], names: string[]): PlaneStateSummary | undefined {
+  const norm = (v: string | undefined) => String(v || "").trim().toLowerCase().replace(/[\s_-]+/g, " ");
+  const wanted = names.map(norm);
+  return states.find((state) => state.id && wanted.includes(norm(state.name)));
+}
+
+/** "Re-Open" when the project defines it, otherwise Backlog (the pre-2026-09 behaviour). */
+export function selectPlaneReopenState(states: PlaneStateSummary[]): PlaneStateSummary | undefined {
+  return findPlaneStateByName(states, ["re-open", "reopen", "reopened"]) || selectPlaneBacklogState(states);
+}
+
+/** "Triaged" when defined, otherwise the unstarted/Todo state, otherwise Backlog. */
+export function selectPlaneTriagedState(states: PlaneStateSummary[]): PlaneStateSummary | undefined {
+  return findPlaneStateByName(states, ["triaged", "triage"]) || selectPlaneTodoState(states) || selectPlaneBacklogState(states);
+}
+
+/** "Delivery to Customer" when defined (customer must confirm), otherwise the completed state. */
+export function selectPlaneDeliveryState(states: PlaneStateSummary[]): PlaneStateSummary | undefined {
+  return findPlaneStateByName(states, ["delivery to customer", "delivered to customer", "delivered"]) || selectPlaneDoneState(states) || selectPlaneTerminalState(states);
+}
+
+/** "Waiting for Customer" when defined, otherwise In Progress. */
+export function selectPlaneWaitingCustomerState(states: PlaneStateSummary[]): PlaneStateSummary | undefined {
+  return findPlaneStateByName(states, ["waiting for customer", "waiting customer", "waiting on customer"]) || selectPlaneInProgressState(states);
+}
+
+/**
+ * Maps either vocabulary — a TicketX lifecycle status (RESOLVED, REOPENED …)
+ * or a Plane label (Delivery to Customer, Re-Open …) — to the project's
+ * actual state, always with a group-based fallback so a project that lacks
+ * the specific state still lands somewhere sensible.
+ */
 export function selectPlaneStateForTicketStatus(states: PlaneStateSummary[], status: string): PlaneStateSummary | undefined {
-  const normalized = (status || "").trim().toLowerCase();
-  if (normalized === "backlog") return selectPlaneBacklogState(states);
+  const normalized = (status || "").trim().toLowerCase().replace(/[\s_-]+/g, " ");
+  if (normalized === "backlog" || normalized === "new") return selectPlaneBacklogState(states);
+  if (normalized === "triaged" || normalized === "triage") return selectPlaneTriagedState(states);
   if (normalized === "todo" || normalized === "to do") return selectPlaneTodoState(states) || selectPlaneBacklogState(states);
-  if (normalized === "in progress" || normalized === "in_progress" || normalized === "started") return selectPlaneInProgressState(states);
-  if (normalized === "done" || normalized === "completed" || normalized === "closed" || normalized === "resolved") return selectPlaneDoneState(states) || selectPlaneTerminalState(states);
+  if (["in progress", "started", "open", "waiting internal", "test failed"].includes(normalized)) {
+    return (normalized === "test failed" && findPlaneStateByName(states, ["test failed"])) || selectPlaneInProgressState(states);
+  }
+  if (normalized === "waiting customer" || normalized === "waiting for customer") return selectPlaneWaitingCustomerState(states);
+  if (["re open", "reopen", "reopened"].includes(normalized)) return selectPlaneReopenState(states);
+  // CUSTOMER_CONFIRMED is the pending close question (two-step close): the
+  // customer said it works but has not pressed "ยืนยันปิดเคส" yet, so Plane
+  // must keep showing Delivery to Customer, never Close.
+  if (["resolved", "delivery to customer", "delivered", "customer confirmed"].includes(normalized)) return selectPlaneDeliveryState(states);
+  if (["done", "completed", "closed", "close"].includes(normalized)) return selectPlaneDoneState(states) || selectPlaneTerminalState(states);
   if (normalized === "cancelled" || normalized === "canceled") return selectPlaneCancelledState(states);
 
   const match = states.find((s) => s.name?.trim().toLowerCase() === normalized || s.group?.trim().toLowerCase() === normalized);
@@ -617,6 +659,7 @@ export function findMatchingPlaneWorkItem(
 
 import { PlaneProjectResolver, PlaneProjectConfig } from "./PlaneProjectResolver";
 import { PlaneApiClient } from "./PlaneApiClient";
+import { urgentAlertService } from "./UrgentAlertService";
 
 export class PlaneService {
   private dbAdapter: DatabaseAdapter;
@@ -733,8 +776,9 @@ export class PlaneService {
     const resolvedPlaneIssueId = await this.resolvePlaneWorkItemId(ticketId, String(planeIssueId));
 
     const states = await this.apiClient.listStates(projectConfig);
-    const backlogState = selectPlaneBacklogState(states);
-    if (!backlogState?.id) throw new Error("Cannot reopen linked Plane work item: project has no Backlog state");
+    // "Re-Open" where the project defines it (Excise does), else Backlog.
+    const backlogState = selectPlaneReopenState(states);
+    if (!backlogState?.id) throw new Error("Cannot reopen linked Plane work item: project has no Re-Open or Backlog state");
 
     await this.apiClient.patchWorkItem(projectConfig, resolvedPlaneIssueId, { state: backlogState.id });
 
@@ -1243,6 +1287,13 @@ export class PlaneService {
       }
     }
 
+
+    // New Urgent Alert email, originated here instead of by Plane's webhook
+    // (which never arrives — ISSUE-053). Fire-and-forget: the flow answers only
+    // after Gmail (~20 s) and promotion must not wait for, or fail on, it.
+    void urgentAlertService
+      .notifyPromoted({ ticketRef: lookupId || ticket.ticket_number || ticket.id, planeIssueId })
+      .catch(() => {});
 
     return {
       id: planeIssueId,

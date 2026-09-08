@@ -10,3 +10,6 @@ build/
 .DS_Store
 Thumbs.db
 scratch/
+
+# SLA cadence console page: personal test tool, not part of the product build
+assets/sla-console/

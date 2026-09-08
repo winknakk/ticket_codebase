@@ -57,6 +57,15 @@ export interface PlaneReverseSyncSummary {
   failed: number;
 }
 
+/**
+ * Normalises a Plane state NAME to the vocabulary TicketLifecycle understands.
+ *
+ * The Excise project (2026-09-07) defines: Backlog, Re-Open (backlog group),
+ * Triaged (unstarted), In Progress / Test Failed / Waiting for Customer /
+ * Delivery to Customer (started), Close (completed), Cancelled. Names are
+ * matched after collapsing spaces, underscores and hyphens, so "Re-Open",
+ * "re_open" and "reopen" all land on the same label.
+ */
 function canonicalStatusName(name: string): string {
   const normalized = name.trim().toLowerCase().replace(/[\s_-]+/g, " ");
   const known: Record<string, string> = {
@@ -65,13 +74,27 @@ function canonicalStatusName(name: string): string {
     todo: "Todo",
     "to do": "Todo",
     unstarted: "Todo",
+    triaged: "Triaged",
+    triage: "Triaged",
     started: "In Progress",
     "in progress": "In Progress",
+    "test failed": "Test Failed",
+    "testing failed": "Test Failed",
+    "waiting for customer": "Waiting for Customer",
+    "waiting customer": "Waiting for Customer",
+    "waiting on customer": "Waiting for Customer",
+    "delivery to customer": "Delivery to Customer",
+    "delivered to customer": "Delivery to Customer",
+    delivered: "Delivery to Customer",
+    "re open": "Re-Open",
+    reopen: "Re-Open",
+    reopened: "Re-Open",
     completed: "Done",
     complete: "Done",
     done: "Done",
     resolved: "Done",
     closed: "Done",
+    close: "Done",
     cancelled: "Cancelled",
     canceled: "Cancelled",
   };
@@ -108,15 +131,17 @@ export function mapPlanePriorityToTicketPriority(priority?: string | null): stri
 export function mapTicketPriorityToPlanePriority(priority?: string | null): string | undefined {
   if (!priority) return undefined;
   const priorityMap: Record<string, string> = {
-    p1: "urgent",
     urgent: "urgent",
-    p2: "high",
     high: "high",
-    p3: "medium",
     medium: "medium",
-    p4: "low",
     low: "low",
     none: "none",
+    // Legacy P-code aliases
+    p1: "urgent",
+    p2: "high",
+    p3: "medium",
+    p4: "low",
+    p5: "none",
   };
   return priorityMap[priority.trim().toLowerCase()];
 }
@@ -136,6 +161,16 @@ export function verifyPlaneWebhookSignature(
 
 export class PlaneWebhookService {
   private readonly doneNotificationDispatcher: (planeIssueId: string) => Promise<void>;
+
+  /**
+   * Per-project state list, so the poller resolves a work item's state id
+   * locally instead of one GET /states/{id}/ per ticket per cycle. Plane
+   * throttles the API key (429 RATE_LIMIT_EXCEEDED seen live 2026-09-07 at
+   * ~40 requests/min); a five-minute cache brings a cycle down to one issue
+   * GET per open ticket. Unknown ids (a state added since) refresh the list.
+   */
+  private readonly statesCache = new Map<string, { at: number; states: Array<{ id?: string; name?: string; group?: string }> }>();
+  private static readonly STATES_CACHE_TTL_MS = 5 * 60_000;
 
   constructor(
     private readonly dbAdapter: DatabaseAdapter,
@@ -283,6 +318,31 @@ export class PlaneWebhookService {
         orgId: row?.org_id ?? null,
         detail: { planeStatus: status, notify: lifecycleResult.notify ?? null, eventId: lifecycleResult.eventId ?? null },
       });
+    } else if (status || state) {
+      // Visible in the database, not only in the terminal: a Plane state that
+      // resolved but changed nothing (NO_CHANGE), was rejected by the
+      // lifecycle rules, or could not be resolved at all. The 2026-09-07
+      // Delivery-to-Customer defect stayed invisible for an hour because the
+      // only evidence was a warn line in a console nobody was watching.
+      const code = lifecycleResult?.code ?? (status ? "NO_TICKET" : "STATE_UNRESOLVED");
+      if (code !== "NO_CHANGE") {
+        const t = await pool
+          .query(`SELECT id, correlation_id, project_id, org_id, conversation_id FROM tickets WHERE plane_issue_id = $1 LIMIT 1`, [planeIssueId])
+          .catch(() => null);
+        const row = t?.rows?.[0];
+        await traceRecorder.record({
+          correlationId: row?.correlation_id || `reverse-sync-${planeIssueId}`,
+          component: "reverse_sync",
+          eventType: "plane_status_not_applied",
+          status: "failed",
+          ticketId: row?.id ?? null,
+          planeIssueId,
+          conversationId: row?.conversation_id ?? null,
+          projectId: row?.project_id ?? null,
+          orgId: row?.org_id ?? null,
+          detail: { planeStatus: status ?? null, rawState: state ?? null, code, reason: lifecycleResult?.reason ?? null },
+        });
+      }
     }
 
     // The notification is driven by the lifecycle transition, not by Plane's
@@ -325,19 +385,22 @@ export class PlaneWebhookService {
     eventId: number | null
   ): Promise<void> {
     const { rows } = await pool.query(
-      `SELECT t.id, t.ticket_number, t.conversation_id, t.project_id, t.org_id
+      `SELECT t.id, t.ticket_number, t.subject, t.conversation_id, t.project_id, t.org_id
          FROM tickets t WHERE t.id = $1 LIMIT 1`,
       [ticketId]
     );
     if (rows.length === 0 || !rows[0].conversation_id) return;
     const ticket = rows[0];
 
+    // Randomized "please test" wording with the [ใช้งานได้แล้ว | ยังมีปัญหาอยู่]
+    // chips; the subject tells the customer which fix to test.
     await customerNotificationService.send({
       conversationId: Number(ticket.conversation_id),
       notificationType: "resolution_confirmation",
       idempotencyKey: eventId ? `ticket_event:${eventId}` : `ticket:${ticketId}:resolved`,
       ticketId: Number(ticket.id),
       ticketNumber: ticket.ticket_number,
+      subject: ticket.subject ?? null,
       projectId: ticket.project_id ?? null,
       orgId: ticket.org_id ?? null,
       correlationId: planeIssueId,
@@ -420,6 +483,14 @@ export class PlaneWebhookService {
                    OR (project_id = $3 AND plane_project_id IS NULL)
                  )
              AND plane_issue_id IS NOT NULL AND plane_issue_id != ''
+             AND deleted_at IS NULL
+             -- Finished tickets are not polled: every one costs a Plane
+             -- request per cycle, and 19 closed/cancelled test tickets were
+             -- enough to push the key into 429 throttling (2026-09-07).
+             -- Re-Open in Plane on a closed ticket is a rare manual act; it
+             -- is picked up when the operator uses the reopen path instead.
+             AND UPPER(COALESCE(status, '')) NOT IN ('CLOSED', 'CANCELLED')
+           ORDER BY updated_at DESC
            LIMIT $4`,
           [workspace_slug, plane_project_id, project_id, batchSize]
         );
@@ -615,11 +686,43 @@ export class PlaneWebhookService {
       throw new Error("Plane state lookup is not configured");
     }
 
+    // Cached project state list first (one request per project per five
+    // minutes), the single-state endpoint only when the id is unknown there.
+    const cacheKey = `${apiBase}|${ws}|${proj}`;
+    const lookup = (states: Array<{ id?: string; name?: string; group?: string }>) =>
+      states.find((s) => String(s.id || "") === String(data.state));
+    const cached = this.statesCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < PlaneWebhookService.STATES_CACHE_TTL_MS) {
+      const hit = lookup(cached.states);
+      if (hit) return { name: hit.name, group: hit.group };
+    }
+    try {
+      const listUrl = `${apiBase}/api/v1/workspaces/${encodeURIComponent(ws)}/projects/${encodeURIComponent(proj)}/states/`;
+      const listRes = await this.httpClient.get(listUrl, { headers: { "X-API-Key": apiKey }, timeout: 5000 });
+      const raw = listRes.data;
+      const states: Array<{ id?: string; name?: string; group?: string }> = Array.isArray(raw) ? raw : Array.isArray(raw?.results) ? raw.results : [];
+      if (states.length) {
+        this.statesCache.set(cacheKey, { at: Date.now(), states });
+        const hit = lookup(states);
+        if (hit) return { name: hit.name, group: hit.group };
+      }
+    } catch (listErr: any) {
+      if (listErr?.response?.status === 429) throw listErr;
+      logger.warn({ error: listErr.message, ws, proj }, "Plane state list fetch failed; falling back to single-state lookup");
+    }
+
     const url = `${apiBase}/api/v1/workspaces/${encodeURIComponent(ws)}/projects/${encodeURIComponent(proj)}/states/${encodeURIComponent(data.state)}/`;
     const response = await this.httpClient.get(url, {
       headers: { "X-API-Key": apiKey },
       timeout: 5000,
     });
-    return { name: response.data?.name, group: response.data?.group };
+    const resolved = { name: response.data?.name, group: response.data?.group };
+    if (!resolved.name && !resolved.group) {
+      logger.warn(
+        { stateId: data.state, ws, proj, keys: response.data ? Object.keys(response.data).slice(0, 8) : null },
+        "Plane state lookup returned no name/group; status will not sync"
+      );
+    }
+    return resolved;
   }
 }

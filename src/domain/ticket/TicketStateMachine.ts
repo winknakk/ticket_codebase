@@ -200,22 +200,40 @@ export class TicketStateMachine {
   }
 
   /** Maps Plane's wider vocabulary onto the four states we store. */
+  /** The Plane label recorded in tickets.plane_status (engineering state, Plane's to own). */
   private normalisePlaneStatus(planeStatus: string): string | null {
-    switch (String(planeStatus || "").trim().toLowerCase()) {
+    switch (String(planeStatus || "").trim().toLowerCase().replace(/[\s_-]+/g, " ")) {
       case "backlog":
       case "todo":
       case "to do":
       case "unstarted":
         return "Backlog";
+      case "triaged":
+      case "triage":
+        return "Triaged";
       case "open":
       case "in progress":
-      case "in_progress":
       case "started":
-        return "Open";
+        return "In Progress";
+      case "test failed":
+        return "Test Failed";
+      case "waiting for customer":
+      case "waiting customer":
+        return "Waiting for Customer";
+      case "delivery to customer":
+      case "delivered":
+        return "Delivery to Customer";
+      case "re open":
+      case "reopen":
+      case "reopened":
+        return "Re-Open";
       case "done":
       case "complete":
       case "completed":
         return "Done";
+      case "close":
+      case "closed":
+        return "Close";
       case "cancelled":
       case "canceled":
         return "Cancelled";

@@ -30,8 +30,24 @@ export const TICKET_LIFECYCLE_STATUSES = [
 
 export type TicketLifecycleStatus = (typeof TICKET_LIFECYCLE_STATUSES)[number];
 
-/** The Plane states TicketX writes. */
-export const PLANE_STATUSES = ["Backlog", "Open", "Done", "Cancelled"] as const;
+/**
+ * The Plane state labels TicketX writes (stored in tickets.plane_status and
+ * used to pick the target Plane state by name, with group fallbacks).
+ * "Open" and "Done" remain for older rows; new writes use the Excise
+ * project's vocabulary.
+ */
+export const PLANE_STATUSES = [
+  "Backlog",
+  "Triaged",
+  "Open",
+  "In Progress",
+  "Waiting for Customer",
+  "Delivery to Customer",
+  "Re-Open",
+  "Done",
+  "Close",
+  "Cancelled",
+] as const;
 export type PlaneStatus = (typeof PLANE_STATUSES)[number];
 
 /** Who is attempting a transition. Authorization differs per actor. */
@@ -57,15 +73,19 @@ export function isTerminal(status: TicketLifecycleStatus): boolean {
 
 const LIFECYCLE_TO_PLANE: Record<TicketLifecycleStatus, PlaneStatus> = {
   NEW: "Backlog",
-  TRIAGED: "Backlog",
-  OPEN: "Open",
-  IN_PROGRESS: "Open",
-  WAITING_CUSTOMER: "Open",
-  WAITING_INTERNAL: "Open",
-  RESOLVED: "Done",
-  CUSTOMER_CONFIRMED: "Done",
-  CLOSED: "Done",
-  REOPENED: "Open",
+  TRIAGED: "Triaged",
+  OPEN: "In Progress",
+  IN_PROGRESS: "In Progress",
+  WAITING_CUSTOMER: "Waiting for Customer",
+  WAITING_INTERNAL: "In Progress",
+  // Engineering hands the fix to the customer; the customer's confirmation
+  // (not Plane) is what moves the ticket on to Close.
+  RESOLVED: "Delivery to Customer",
+  // The close question is still pending: Plane keeps showing Delivery until
+  // the customer presses "ยืนยันปิดเคส".
+  CUSTOMER_CONFIRMED: "Delivery to Customer",
+  CLOSED: "Close",
+  REOPENED: "Re-Open",
   CANCELLED: "Cancelled",
 };
 
@@ -110,22 +130,48 @@ export function planeStatusToLifecycle(
     case "todo":
     case "to do":
     case "unstarted":
-      return current === "NEW" || current === "TRIAGED" ? "TRIAGED" : null;
+    case "triaged":
+      // Only an advance out of NEW; an already-triaged or active ticket is
+      // never dragged back.
+      return current === "NEW" ? "TRIAGED" : null;
 
     case "open":
     case "in progress":
     case "in_progress":
     case "started":
-      // Engineering picking the work up. Never overrides a state that is
-      // waiting on a person.
-      if (current === "WAITING_CUSTOMER" || current === "WAITING_INTERNAL") return null;
+    case "test failed":
+      // Engineering picking the work up (or a failed test sending it back to
+      // the bench — still "being fixed" from the customer's point of view).
+      // Never overrides a state that is waiting on a person, except when the
+      // work explicitly resumes from Waiting for Customer via Plane.
+      if (current === "WAITING_INTERNAL") return null;
+      if (current === "WAITING_CUSTOMER") return normalized === "test failed" ? null : "IN_PROGRESS";
       return current === "IN_PROGRESS" ? null : "IN_PROGRESS";
+
+    case "waiting for customer":
+    case "waiting_customer":
+      if (current === "WAITING_CUSTOMER") return null;
+      if (current === "RESOLVED" || current === "CUSTOMER_CONFIRMED" || current === "CLOSED" || current === "CANCELLED") return null;
+      return "WAITING_CUSTOMER";
+
+    case "re-open":
+    case "re open":
+    case "reopen":
+    case "reopened":
+      // Engineering found the problem is back (or the customer did, via
+      // Plane). Only meaningful from a finished state; an active ticket is
+      // already open.
+      if (current === "RESOLVED" || current === "CUSTOMER_CONFIRMED" || current === "CLOSED" || current === "CANCELLED") return "REOPENED";
+      return null;
 
     case "done":
     case "completed":
     case "complete":
-      // THE critical asymmetry: engineering finishing is not the customer
-      // agreeing. Done produces RESOLVED, and the customer alone moves it on.
+    case "close":
+    case "delivery to customer":
+      // THE critical asymmetry: engineering finishing (Delivery to Customer,
+      // or Close set by hand) is not the customer agreeing. It produces
+      // RESOLVED, and the customer alone moves it on.
       if (current === "RESOLVED" || current === "CUSTOMER_CONFIRMED" || current === "CLOSED") return null;
       return "RESOLVED";
 
@@ -143,17 +189,27 @@ export function planeStatusToLifecycle(
 // ---------------------------------------------------------------------------
 
 const ALLOWED_TRANSITIONS: Record<TicketLifecycleStatus, readonly TicketLifecycleStatus[]> = {
-  NEW: ["TRIAGED", "OPEN", "IN_PROGRESS", "CANCELLED"],
-  TRIAGED: ["OPEN", "IN_PROGRESS", "WAITING_INTERNAL", "CANCELLED"],
+  // Engineering may deliver (or park on the customer) straight from Backlog /
+  // Triaged without ever pressing In Progress — seen live 2026-09-07: EXAI-67
+  // moved Triaged → Delivery to Customer and the poller rejected it every
+  // 30 s, so the customer never got the "please test" message.
+  NEW: ["TRIAGED", "OPEN", "IN_PROGRESS", "WAITING_CUSTOMER", "RESOLVED", "CANCELLED"],
+  TRIAGED: ["OPEN", "IN_PROGRESS", "WAITING_CUSTOMER", "WAITING_INTERNAL", "RESOLVED", "CANCELLED"],
   OPEN: ["IN_PROGRESS", "WAITING_CUSTOMER", "WAITING_INTERNAL", "RESOLVED", "CANCELLED"],
   IN_PROGRESS: ["WAITING_CUSTOMER", "WAITING_INTERNAL", "RESOLVED", "CANCELLED"],
   WAITING_CUSTOMER: ["IN_PROGRESS", "RESOLVED", "CANCELLED"],
   WAITING_INTERNAL: ["IN_PROGRESS", "RESOLVED", "CANCELLED"],
   // Only the customer leaves RESOLVED.
   RESOLVED: ["CUSTOMER_CONFIRMED", "REOPENED"],
-  CUSTOMER_CONFIRMED: ["CLOSED"],
+  // CUSTOMER_CONFIRMED = "the customer said it works; the close question is
+  // pending" (two-step close, 2026-09-07). It resolves to CLOSED on the
+  // confirmation chip, to REOPENED if the customer changes their mind, or back
+  // to RESOLVED if they decline to close for now.
+  CUSTOMER_CONFIRMED: ["CLOSED", "REOPENED", "RESOLVED"],
   CLOSED: ["REOPENED"],
-  REOPENED: ["IN_PROGRESS", "CANCELLED"],
+  // Engineering may deliver straight from Re-Open (Plane: Re-Open → Delivery
+  // to Customer) without passing through In Progress first.
+  REOPENED: ["IN_PROGRESS", "WAITING_CUSTOMER", "RESOLVED", "CANCELLED"],
   CANCELLED: ["REOPENED"],
 };
 
@@ -168,6 +224,9 @@ const ACTOR_TRANSITIONS: Record<TransitionActor, readonly string[]> = {
   customer: [
     "RESOLVED->CUSTOMER_CONFIRMED",
     "RESOLVED->REOPENED",
+    "CUSTOMER_CONFIRMED->CLOSED",
+    "CUSTOMER_CONFIRMED->REOPENED",
+    "CUSTOMER_CONFIRMED->RESOLVED",
     "CLOSED->REOPENED",
     "WAITING_CUSTOMER->IN_PROGRESS",
   ],
@@ -177,14 +236,33 @@ const ACTOR_TRANSITIONS: Record<TransitionActor, readonly string[]> = {
     "TRIAGED->IN_PROGRESS",
     "OPEN->IN_PROGRESS",
     "REOPENED->IN_PROGRESS",
+    "WAITING_CUSTOMER->IN_PROGRESS",
+    "NEW->RESOLVED",
+    "TRIAGED->RESOLVED",
     "OPEN->RESOLVED",
     "IN_PROGRESS->RESOLVED",
     "WAITING_CUSTOMER->RESOLVED",
     "WAITING_INTERNAL->RESOLVED",
+    "REOPENED->RESOLVED",
+    // "Waiting for Customer" state in Plane.
+    "NEW->WAITING_CUSTOMER",
+    "TRIAGED->WAITING_CUSTOMER",
+    "OPEN->WAITING_CUSTOMER",
+    "IN_PROGRESS->WAITING_CUSTOMER",
+    "REOPENED->WAITING_CUSTOMER",
+    // "Re-Open" state in Plane (operator decision 2026-09-07): engineering may
+    // reopen a finished ticket. This only ever ADDS work — it can still not
+    // confirm or close on the customer's behalf.
+    "RESOLVED->REOPENED",
+    "CLOSED->REOPENED",
+    "CANCELLED->REOPENED",
     "NEW->CANCELLED",
     "TRIAGED->CANCELLED",
     "OPEN->CANCELLED",
     "IN_PROGRESS->CANCELLED",
+    "WAITING_CUSTOMER->CANCELLED",
+    "WAITING_INTERNAL->CANCELLED",
+    "REOPENED->CANCELLED",
   ],
   // Operators and the system may perform any structurally valid transition.
   operator: ["*"],

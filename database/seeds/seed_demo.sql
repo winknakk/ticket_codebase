@@ -187,34 +187,25 @@ ON CONFLICT DO NOTHING;
 
 INSERT INTO project_sla_policies (project_id, priority, priority_name, description, response_hours, resolve_hours, service_window, is_default, display_order) VALUES
   -- Project 1 (Demo)
-  (1, 'P1', 'Critical', 'System outage affecting all users', 1, 4, '24x7', false, 1),
-  (1, 'P2', 'Severe', 'Major functionality unavailable', 4, 24, '24x7', false, 2),
-  (1, 'P3', 'Major', 'Partial impact, business still operational', 8, 72, 'Business Hours', true, 3),
-  (1, 'P4', 'Minor', 'Minimal impact', 24, 168, 'Business Hours', false, 4),
+  (1, 'Urgent', 'Urgent', 'ระบบไม่สามารถใช้งานได้ เช่น 404 หรือหน้าเว็บไม่สามารถเปิดได้', 0.25, 4, '24x7', false, 1),
+  (1, 'High', 'High', 'เข้าใช้งานระบบได้ แต่ไม่สามารถทำงานต่อได้ เช่น กดปุ่มไม่ได้', 0.5, 8, '24x7', false, 2),
+  (1, 'Medium', 'Medium', 'ปัญหาทั่วไปที่ยังสามารถใช้งานต่อได้ เช่น คำนวณผิด แสดงผลผิด', 2, 48, 'Business Hours', true, 3),
+  (1, 'Low', 'Low', 'ปัญหาเล็กน้อยที่ไม่กระทบหลัก เช่น จัดรูปแบบ Word/PDF', 24, 120, 'Business Hours', false, 4),
+  (1, 'None', 'None', 'คำขอเพิ่มเติม (Feature Request) ไม่ใช่ปัญหาของระบบ', 48, 999, 'Business Hours', false, 5),
   
   -- Project 2
-  (2, 'P1', 'Critical', 'System outage affecting all users', 1, 2, '24x7', false, 1),
-  (2, 'P2', 'Severe', 'Major functionality unavailable', 2, 12, '24x7', false, 2),
-  (2, 'P3', 'Major', 'Partial impact, business still operational', 8, 48, 'Business Hours', true, 3),
-  (2, 'P4', 'Minor', 'Minimal impact', 24, 96, 'Business Hours', false, 4),
+  (2, 'Urgent', 'Urgent', 'ระบบไม่สามารถใช้งานได้ เช่น 404 หรือหน้าเว็บไม่สามารถเปิดได้', 0.25, 4, '24x7', false, 1),
+  (2, 'High', 'High', 'เข้าใช้งานระบบได้ แต่ไม่สามารถทำงานต่อได้ เช่น กดปุ่มไม่ได้', 0.5, 8, '24x7', false, 2),
+  (2, 'Medium', 'Medium', 'ปัญหาทั่วไปที่ยังสามารถใช้งานต่อได้ เช่น คำนวณผิด แสดงผลผิด', 2, 48, 'Business Hours', true, 3),
+  (2, 'Low', 'Low', 'ปัญหาเล็กน้อยที่ไม่กระทบหลัก เช่น จัดรูปแบบ Word/PDF', 24, 120, 'Business Hours', false, 4),
+  (2, 'None', 'None', 'คำขอเพิ่มเติม (Feature Request) ไม่ใช่ปัญหาของระบบ', 48, 999, 'Business Hours', false, 5),
   
   -- Project 8
-  (8, 'P1', 'Critical', 'System outage affecting all users', 1, 4, '24x7', false, 1),
-  (8, 'P2', 'Severe', 'Major functionality unavailable', 4, 24, '24x7', false, 2),
-  (8, 'P3', 'Major', 'Partial impact, business still operational', 8, 72, 'Business Hours', true, 3),
-  (8, 'P4', 'Minor', 'Minimal impact', 24, 168, 'Business Hours', false, 4),
-  
-  -- SSO SLA (ระดับ 1 = P1 = 4h, ระดับ 2 = P2 = 8h, ระดับ 3 = P3 = 48h)
-  (11, 'P1', 'Critical', 'ระบบ SSO ไม่สามารถใช้งานได้ทั้งหมด', 1, 4, '24x7', false, 1),
-  (11, 'P2', 'Severe', 'บางส่วนไม่สามารถใช้งานได้ ซึ่งไม่กระทบกับระบบ', 2, 8, '24x7', false, 2),
-  (11, 'P3', 'Major', 'คำแนะนำการใช้งานระบบ โดยระบบยังใช้งานได้ปกติ', 8, 48, 'Business Hours', true, 3),
-  
-  -- CRA SLA (P1 = 4h, P2 = 6h, P3 = 24h, P4 = 48h, P5 = 72h)
-  (12, 'P1', 'Critical', 'ระบบ EW ทั้งหมดล่ม / ผู้ใช้ทุกคนได้รับผลกระทบ', 1, 4, '24x7', false, 1),
-  (12, 'P2', 'Severe', 'EW บางส่วนล่ม / ผู้ใช้หลายหน่วยงานได้รับผลกระทบ', 4, 6, '24x7', false, 2),
-  (12, 'P3', 'Major', 'EW บางส่วน / ผู้ใช้บางหน่วยงาน ยังดำเนินธุรกรรมได้', 8, 24, 'Business Hours', true, 3),
-  (12, 'P4', 'Moderate', 'EW บางส่วน / กระทบน้อย ยังดำเนินธุรกรรมได้ปกติ', 12, 48, 'Business Hours', false, 4),
-  (12, 'P5', 'Minor', 'กระทบระบบเดียว / กระทบน้อย ไม่เร่งด่วน', 24, 72, 'Business Hours', false, 5)
+  (8, 'Urgent', 'Urgent', 'ระบบไม่สามารถใช้งานได้ เช่น 404 หรือหน้าเว็บไม่สามารถเปิดได้', 0.25, 4, '24x7', false, 1),
+  (8, 'High', 'High', 'เข้าใช้งานระบบได้ แต่ไม่สามารถทำงานต่อได้ เช่น กดปุ่มไม่ได้', 0.5, 8, '24x7', false, 2),
+  (8, 'Medium', 'Medium', 'ปัญหาทั่วไปที่ยังสามารถใช้งานต่อได้ เช่น คำนวณผิด แสดงผลผิด', 2, 48, 'Business Hours', true, 3),
+  (8, 'Low', 'Low', 'ปัญหาเล็กน้อยที่ไม่กระทบหลัก เช่น จัดรูปแบบ Word/PDF', 24, 120, 'Business Hours', false, 4),
+  (8, 'None', 'None', 'คำขอเพิ่มเติม (Feature Request) ไม่ใช่ปัญหาของระบบ', 48, 999, 'Business Hours', false, 5)
 ON CONFLICT (project_id, priority) DO NOTHING;
 
 INSERT INTO project_ai_settings (project_id, confidence_threshold, max_handoff_depth, vector_match_threshold) VALUES 

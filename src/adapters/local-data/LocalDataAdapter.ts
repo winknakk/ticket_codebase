@@ -128,7 +128,7 @@ export class LocalDataAdapter implements DatabaseAdapter {
       subject: input.subject,
       summary: input.summary,
       status: "open",
-      priority: input.priority === "P1" || input.priority === "P2" ? "urgent" : "normal",
+      priority: ["urgent", "high", "p1", "p2"].includes(String(input.priority || "").toLowerCase()) ? "urgent" : "normal",
       assigned_pm: "pm_lek",
       created_via: "ai",
       plane_issue_id: null,

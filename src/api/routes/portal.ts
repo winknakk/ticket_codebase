@@ -13,7 +13,7 @@ const CreatePortalTicketSchema = z.object({
   projectId: z.string().optional(),
   subject: z.string().min(1),
   summary: z.string().min(1),
-  priority: z.enum(["P1", "P2", "P3", "P4", "Urgent", "High", "Medium", "Low"]).default("P3"),
+  priority: z.enum(["Urgent", "High", "Medium", "Low", "None", "P1", "P2", "P3", "P4", "P5"]).default("Medium"),
   severity: z.enum(["Critical", "High", "Medium", "Low"]).default("Medium"),
 });
 

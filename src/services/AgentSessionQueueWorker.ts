@@ -2,6 +2,7 @@ import axios from "axios";
 import { AgentSessionQueueService, QueueItem } from "./AgentSessionQueueService";
 import { createLogger } from "../observability/logger";
 import { tokenForContext } from "../domain/execution/ExecutionContextService";
+import { LineTypingIndicatorService } from "./LineTypingIndicatorService";
 
 const logger = createLogger("agent-session-worker");
 
@@ -10,12 +11,26 @@ export interface WorkerConfig {
   leaseDurationMs?: number;
   maxAttempts?: number;
   watchdogIntervalMs?: number;
+  /**
+   * When present, a dispatched turn is considered complete only once the AI
+   * reply row has been observed in `messages` (or `turnCompletionTimeoutMs`
+   * passes), and the LINE typing indicator is kept alive meanwhile.
+   *
+   * The PromptX gateway webhook acknowledges immediately (no `/sync`), so
+   * without this the "turn completed" point is really the accept point and
+   * two batches for one conversation can run through the AI concurrently.
+   */
+  typingIndicator?: LineTypingIndicatorService;
+  /** Upper bound for the reply wait; clamped to stay inside the lease. */
+  turnCompletionTimeoutMs?: number;
 }
 
 export class AgentSessionQueueWorker {
   private readonly dmGatewayUrl: string;
   private readonly leaseDurationMs: number;
   private readonly maxAttempts: number;
+  private readonly typingIndicator: LineTypingIndicatorService | null;
+  private readonly turnCompletionTimeoutMs: number;
   private readonly activeDispatches = new Set<number>();
   private watchdogTimer: NodeJS.Timeout | null = null;
   private isStopping = false;
@@ -27,6 +42,13 @@ export class AgentSessionQueueWorker {
     this.dmGatewayUrl = config.dmGatewayUrl;
     this.leaseDurationMs = config.leaseDurationMs || 120000;
     this.maxAttempts = config.maxAttempts || 2;
+    this.typingIndicator = config.typingIndicator || null;
+    // The wait must finish before the lease does, or the watchdog would
+    // recover an item whose turn is still legitimately in flight.
+    this.turnCompletionTimeoutMs = Math.min(
+      config.turnCompletionTimeoutMs || 90000,
+      Math.max(10000, this.leaseDurationMs - 5000)
+    );
 
     if (config.watchdogIntervalMs && config.watchdogIntervalMs > 0) {
       this.startWatchdog(config.watchdogIntervalMs);
@@ -106,6 +128,20 @@ export class AgentSessionQueueWorker {
             }
           : stored;
 
+        // High-water mark taken BEFORE dispatch so a reply persisted
+        // quickly by the flow cannot be missed.
+        let sinceMessageId = 0;
+        if (this.typingIndicator) {
+          try {
+            sinceMessageId = await this.typingIndicator.latestMessageId(conversationId);
+          } catch (markErr: any) {
+            logger.warn(
+              { queueItemId, conversationId, error: markErr.message },
+              "[agent-worker] Could not read message high-water mark; reply wait will use 0"
+            );
+          }
+        }
+
         await axios.post(this.dmGatewayUrl, outboundPayload, {
           headers: {
             "Content-Type": "application/json",
@@ -117,8 +153,29 @@ export class AgentSessionQueueWorker {
 
         logger.info(
           { queueItemId, conversationId },
-          "[agent-worker] Agent turn completed successfully"
+          "[agent-worker] Agent turn accepted by gateway"
         );
+
+        if (this.typingIndicator) {
+          // Phase C of the typing indicator and the real end of the turn:
+          // keep "typing" alive and hold the lease until the AI reply row is
+          // observed. A silent turn (IGNORE, silent handoff, muted) ends at
+          // the timeout - that is the price of not double-running turns.
+          const firstEvent = Array.isArray(stored?.events) ? stored.events[0] : null;
+          const sourceUserId = firstEvent?.source?.type === "user" ? String(firstEvent.source.userId || "") : "";
+          const waited = await this.typingIndicator.waitForReply({
+            conversationId,
+            userId: LineTypingIndicatorService.isDirectUserId(sourceUserId) ? sourceUserId : null,
+            sinceMessageId,
+            timeoutMs: this.turnCompletionTimeoutMs,
+          });
+          logger.info(
+            { queueItemId, conversationId, replied: waited.replied, waitMs: waited.elapsedMs, polls: waited.polls },
+            waited.replied
+              ? "[agent-worker] Agent turn reply observed"
+              : "[agent-worker] Agent turn reply not observed before timeout; releasing turn"
+          );
+        }
 
         // Atomically complete this item and claim the next item if available
         currentItem = await this.queueService.completeAndClaimNext(
