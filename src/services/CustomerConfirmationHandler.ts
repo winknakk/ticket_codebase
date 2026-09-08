@@ -229,7 +229,7 @@ export class CustomerConfirmationHandler {
 
     await this.notify(input, ticket, "closed", closedEventId ? `ticket_event:${closedEventId}` : `ticket:${ticket.id}:closed`, { quickReplies: [] });
     // Customer "Done" email (Gmail via the notification flow), originated here
-    // because Plane's own webhook never arrives (ISSUE-053). Fire-and-forget.
+    // because Plane's own webhook never arrives (ISSUE-070). Fire-and-forget.
     void doneEmailService.notifyClosed({ ticketId: ticket.id, closeEventId: closedEventId, correlationId: input.correlationId }).catch(() => {});
     logger.info({ ticketId: ticket.id, conversationId: input.conversationId, correlationId: input.correlationId, from: ticket.status }, "Ticket closed by customer confirmation");
     return { handled: true, ticketId: ticket.id, from: ticket.status, to: "CLOSED" };

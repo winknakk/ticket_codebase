@@ -1289,7 +1289,7 @@ export class PlaneService {
 
 
     // New Urgent Alert email, originated here instead of by Plane's webhook
-    // (which never arrives — ISSUE-053). Fire-and-forget: the flow answers only
+    // (which never arrives — ISSUE-070). Fire-and-forget: the flow answers only
     // after Gmail (~20 s) and promotion must not wait for, or fail on, it.
     void urgentAlertService
       .notifyPromoted({ ticketRef: lookupId || ticket.ticket_number || ticket.id, planeIssueId })

@@ -10,7 +10,7 @@ const logger = createLogger("UrgentAlertService");
  *
  * The Incident Alert email used to depend on Plane delivering a
  * `workitem.created` webhook to the Plane Webhook Notification Flow. Plane on
- * projects.oneweb.tech delivers nothing (ISSUE-053), so no Urgent ticket ever
+ * projects.oneweb.tech delivers nothing (ISSUE-070), so no Urgent ticket ever
  * produced the email. TicketX itself knows the moment an Urgent ticket is
  * promoted to Plane, so it posts the same Plane-shaped payload to the same
  * flow URL. The flow's urgent branch (guard → ticket lookup by
