@@ -4,6 +4,53 @@ import { ConstantSystemService } from "./ConstantSystemService";
 
 const logger = createLogger("CentralAuthService");
 
+/** Which second factor Center will accept, and the reference tying a code to this login. */
+export interface CenterChallenge {
+  method: "totp" | "email" | "sms";
+  /** null for an authenticator app — only the delivered-code methods carry one. */
+  ref: string | null;
+}
+
+/** The second factor on a resubmitted login. */
+export interface CenterSecondFactor {
+  code: string;
+  method?: "totp" | "email" | "sms";
+  ref?: string | null;
+}
+
+/**
+ * Not a failure — Center is asking for the second factor. Carried as a distinct
+ * type so the route can answer with a challenge instead of "wrong password".
+ */
+export class CenterTwoFactorRequiredError extends Error {
+  readonly challenge: CenterChallenge;
+  constructor(challenge: CenterChallenge) {
+    super("Center requires a second factor");
+    this.name = "CenterTwoFactorRequiredError";
+    this.challenge = challenge;
+  }
+}
+
+/**
+ * Read a 2FA challenge out of a Center rejection.
+ *
+ * Center signals it with `error: "Require TOTP"` and names the factor in
+ * `error_description`: empty means the authenticator app, "email:<ref>" an
+ * emailed code, and anything else is an SMS reference (optionally prefixed
+ * "sms:"). Returns null when the rejection is an ordinary one.
+ */
+export function parseCenterChallenge(errBody: any): CenterChallenge | null {
+  const error = String(errBody?.error ?? "");
+  if (error !== "Require TOTP" && error !== "TOTP required but not provided") return null;
+
+  const description = String(errBody?.error_description ?? "");
+  if (!description) return { method: "totp", ref: null };
+  if (description.startsWith("email:")) {
+    return { method: "email", ref: description.slice("email:".length) };
+  }
+  return { method: "sms", ref: description.startsWith("sms:") ? description.slice("sms:".length) : description };
+}
+
 export interface CenterLoginResponse {
   tokenType: string;
   token: string;
@@ -82,9 +129,30 @@ export class CentralAuthService {
   }
 
   /**
-   * Authenticate directly with the Central IAM Server
+   * Authenticate directly with the Central IAM Server.
+   *
+   * Center completes 2FA on this same endpoint — there is no separate verify
+   * call — but it is particular about which field the code arrives in, and the
+   * fields are not interchangeable:
+   *
+   *   authenticator app  ->  totp
+   *   emailed / texted   ->  otp + otpRef (the ref from the challenge)
+   *
+   * This used to send the code under five names at once (otp, totp, code,
+   * authCode, authenticatorCode) in the hope that one would be the right one.
+   * That is why an authenticator code never worked: `otp` present without a
+   * valid `otpRef` reads to Center as "an email code was submitted, and its
+   * reference is missing", and it rejects the whole login — so the guess that
+   * was meant to be harmless was the thing doing the harm.
    */
-  async loginToCenter(username: string, password: string, otp?: string): Promise<CenterLoginResponse> {
+  async loginToCenter(
+    username: string,
+    password: string,
+    secondFactor?: string | CenterSecondFactor
+  ): Promise<CenterLoginResponse> {
+    const factor: CenterSecondFactor | undefined =
+      typeof secondFactor === "string" ? { code: secondFactor } : secondFactor;
+
     try {
       const payload: Record<string, any> = {
         username,
@@ -96,12 +164,17 @@ export class CentralAuthService {
         groupIam2ID: null,
       };
 
-      if (otp) {
-        payload.otp = otp.trim();
-        payload.totp = otp.trim();
-        payload.code = otp.trim();
-        payload.authCode = otp.trim();
-        payload.authenticatorCode = otp.trim();
+      const code = factor?.code?.trim();
+      if (code) {
+        // Exactly one shape, chosen by the method the challenge named. An
+        // empty otp/otpRef pair is worse than sending nothing, so neither key
+        // appears unless it carries a real value.
+        if (factor?.method === "email" || factor?.method === "sms") {
+          payload.otp = code;
+          if (factor.ref) payload.otpRef = factor.ref;
+        } else {
+          payload.totp = code;
+        }
       }
 
       const res = await fetch(this.centerAuthUrl, {
@@ -117,6 +190,12 @@ export class CentralAuthService {
         } catch {
           // ignore
         }
+
+        // A 2FA-protected account answers a plain password with an error, not
+        // a token, and names the second factor in error_description.
+        const challenge = parseCenterChallenge(errBody);
+        if (challenge) throw new CenterTwoFactorRequiredError(challenge);
+
         const errMsg = errBody?.error || errBody?.error_description || `Center Auth failed with status: ${res.status}`;
         throw new Error(errMsg);
       }
@@ -124,8 +203,39 @@ export class CentralAuthService {
       const data = (await res.json()) as CenterLoginResponse;
       return data;
     } catch (err: any) {
+      if (err instanceof CenterTwoFactorRequiredError) {
+        logger.info({ username, method: err.challenge.method }, "Center requires a second factor");
+        throw err;
+      }
       logger.warn({ error: err.message, username }, "Center Auth network call failed, attempting token parse or fallback");
       throw err;
+    }
+  }
+
+  /**
+   * Ask Center to deliver a one-time code for an email or SMS second factor.
+   * Center's challenge names the method but does not send the code; the client
+   * has to trigger it before the user has anything to type.
+   */
+  async sendCenterOtp(username: string, method: "email" | "sms"): Promise<void> {
+    const sendCodeUrl = this.centerAuthUrl.replace(/\/login$/, "/sendcode");
+    try {
+      await fetch(sendCodeUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: username,
+          username,
+          phoneNumber: "",
+          phoneCountry: "",
+          isVerifyAccount: false,
+          isEmail: method === "email",
+        }),
+      });
+    } catch (err: any) {
+      // Best effort: the challenge is still worth returning to the caller, who
+      // can offer a resend. Failing the login here would be worse.
+      logger.warn({ error: err.message, username, method }, "Center sendcode failed");
     }
   }
 

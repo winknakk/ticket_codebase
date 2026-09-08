@@ -98,6 +98,27 @@ export class S3MediaStorageService implements IMediaStorageService {
     return `${this.publicCdnBaseUrl}/file?key=${encodeURIComponent(normalizedStorageKey)}&expires=${expiresAt}&signature=${token}`;
   }
 
+  async generateDirectUploadUrl(storageKey: string, expiresInSeconds: number = 3600): Promise<string> {
+    const normalizedStorageKey = this.normalizeStorageKey(storageKey);
+    const expiresAt = Math.floor(Date.now() / 1000) + expiresInSeconds;
+    const token = this.createSignature(normalizedStorageKey, expiresAt);
+
+    const baseUrl = this.publicCdnBaseUrl.replace(/\/api\/v1\/media\/?$/, "");
+    return `${baseUrl}/api/v1/webchat/upload/direct?key=${encodeURIComponent(normalizedStorageKey)}&expires=${expiresAt}&signature=${token}`;
+  }
+
+  async saveBuffer(storageKey: string, buffer: Buffer): Promise<void> {
+    const normalizedStorageKey = this.normalizeStorageKey(storageKey);
+    const fullPath = this.resolveStoragePath(normalizedStorageKey);
+    const dir = path.dirname(fullPath);
+
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    await fs.promises.writeFile(fullPath, buffer);
+  }
+
   verifyPresignedUrl(storageKey: string, expires: string | number, signature: string): boolean {
     let normalizedStorageKey: string;
     try {

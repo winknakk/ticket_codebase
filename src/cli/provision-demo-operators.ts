@@ -59,6 +59,13 @@ const DEMO_ACCOUNTS: DemoAccount[] = [
     password: "agent123",
     needsProjectAccess: true,
   },
+  {
+    email: "customer.win@ticketx.local",
+    name: "คุณวิน (ลูกค้า)",
+    role: "employee",
+    password: "customer123",
+    needsProjectAccess: false,
+  },
 ];
 
 /**
@@ -101,11 +108,13 @@ async function main() {
 
     for (const account of DEMO_ACCOUNTS) {
       const hash = await hashPassword(account.password);
+      const nextOpRes = await client.query("SELECT COALESCE(MAX(CASE WHEN id::text ~ '^[0-9]+$' THEN id::bigint ELSE 0 END), 0) + 1 AS next_id FROM operators");
+      const nextId = String(nextOpRes.rows[0]?.next_id || Date.now());
 
       const { rows } = await client.query(
-        `INSERT INTO operators (company_id, email, name, display_name, role, status, is_active, password_hash)
-         VALUES ($1, $2, $3, $3, $4, 'active', TRUE, $5)
-         ON CONFLICT (company_id, email) DO UPDATE
+        `INSERT INTO operators (id, company_id, email, name, display_name, role, status, is_active, password_hash, settings)
+         VALUES ($1, $2, $3, $4, $4, $5, 'active', TRUE, $6, '{}'::jsonb)
+         ON CONFLICT (email) DO UPDATE
             SET role = EXCLUDED.role,
                 status = 'active',
                 is_active = TRUE,
@@ -113,7 +122,7 @@ async function main() {
                 deleted_at = NULL,
                 updated_at = NOW()
          RETURNING id, email, role`,
-        [COMPANY_ID, account.email, account.name, account.role, hash]
+        [nextId, COMPANY_ID, account.email, account.name, account.role, hash]
       );
 
       const operator = rows[0];
@@ -134,6 +143,33 @@ async function main() {
           );
           console.log(`    granted access to project ${projectId}`);
         }
+      }
+
+      // Ensure user_roles mapping exists for org resolution
+      const roleId = `role_${account.email.replace(/[^a-zA-Z0-9]/g, '_')}`;
+      await client.query(
+        `INSERT INTO user_roles (id, user_email, role, org_id, status, created_at)
+         VALUES ($1, $2, $3, 'org_avalant', 'active', NOW())
+         ON CONFLICT (user_email) DO UPDATE SET role = EXCLUDED.role, status = 'active'`,
+        [roleId, account.email, account.role]
+      ).catch(() => {});
+
+      if (account.email.includes("customer")) {
+        // Ensure profile exists for Customer Web App
+        const nextProfId = await client.query("SELECT COALESCE(MAX(CASE WHEN id::text ~ '^[0-9]+$' THEN id::bigint ELSE 0 END), 0) + 1 AS next_id FROM profiles");
+        const pid = nextProfId.rows[0]?.next_id || 101;
+        await client.query(
+          `INSERT INTO profiles (id, name, email, phone, company_id, created_at, updated_at)
+           VALUES ($1, $2, $3, '0812345678', 1, NOW(), NOW())
+           ON CONFLICT DO NOTHING`,
+          [pid, account.name, account.email]
+        ).catch(() => {});
+        await client.query(
+          `INSERT INTO identities (profile_id, channel, channel_ref, created_at)
+           VALUES ($1, 'webchat', $2, NOW())
+           ON CONFLICT DO NOTHING`,
+          [pid, `cust_${account.email.replace(/[^a-zA-Z0-9]/g, '_')}`]
+        ).catch(() => {});
       }
     }
 

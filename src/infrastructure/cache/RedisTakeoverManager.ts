@@ -13,7 +13,7 @@ export class RedisTakeoverManager {
   constructor() {
     this.redis = createRedisClient("redis-takeover-manager", {
       maxRetriesPerRequest: 3,
-      enableOfflineQueue: false,
+      enableOfflineQueue: true,
     });
     this.redis.on("error", (err) => {
       logger.error({ error: err.message }, "RedisTakeoverManager Redis connection error");

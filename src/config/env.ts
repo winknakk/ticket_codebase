@@ -58,6 +58,12 @@ export const EnvSchema = z.object({
   // migrated with the evidence visible. Set to true once the live flow node
   // sends the header.
   STRICT_WEBHOOK_AUTH: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
+  // Opt-in for the demo customer accounts, which sign in with no password at
+  // all. Two routes used to do this unconditionally — any username containing
+  // "customer" was issued a real 24-hour portal token — so the capability is
+  // kept, but only where someone has deliberately asked for it. Production
+  // refuses it regardless of this flag; see validateEnv below.
+  ALLOW_DEMO_LOGIN: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   RATE_LIMIT_MAX: z.coerce.number().default(60),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().default(60000),
   PORT: z.coerce.number().default(3000),
@@ -169,6 +175,16 @@ export const validateEnv = (): Env => {
         "CONFIGURATION ERROR: SESSION_SECRET must be set to at least 32 characters in production. " +
           "It signs operator sessions and AgentX execution-context tokens; without it, ticket " +
           "creation fails closed at runtime."
+      );
+    }
+
+    // Demo login issues a portal token to anyone who asks for it. Refusing to
+    // boot is the only setting that cannot be undone by a stray environment
+    // variable on the production host.
+    if (env.ALLOW_DEMO_LOGIN) {
+      throw new Error(
+        "CONFIGURATION ERROR: ALLOW_DEMO_LOGIN must not be enabled in production. " +
+          "It permits password-free sign-in to the customer portal."
       );
     }
   }

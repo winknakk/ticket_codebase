@@ -1,7 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 
-import { CentralAuthService } from "../../services/CentralAuthService";
+import { CentralAuthService, CenterTwoFactorRequiredError } from "../../services/CentralAuthService";
 import { getSessionTokenService } from "../../middleware/auth";
 import { SessionTokenService } from "../../infrastructure/security/SessionTokenService";
 import { config } from "../../config/env";
@@ -17,6 +17,11 @@ const LoginSchema = z.object({
   username: z.string(),
   password: z.string(),
   otp: z.string().optional(),
+  // Which second factor the code answers, and the reference Center issued with
+  // the challenge. An authenticator code needs neither; an emailed or texted
+  // code is rejected without the ref.
+  method: z.enum(["totp", "email", "sms"]).optional(),
+  ref: z.string().optional(),
 });
 
 const CenterTokenSchema = z.object({
@@ -73,10 +78,14 @@ export async function registerAuthRoutes(fastify: FastifyInstance) {
       return reply.status(400).send({ error: "Invalid login payload" });
     }
 
-    const { username, password, otp } = parseResult.data;
+    const { username, password, otp, method, ref } = parseResult.data;
 
     try {
-      const centerRes = await centralAuthService.loginToCenter(username, password, otp);
+      const centerRes = await centralAuthService.loginToCenter(username, password, {
+        code: otp || "",
+        method,
+        ref,
+      });
       const token = centerRes.token || centerRes.access_token || "";
       const idToken = centerRes.IDToken || centerRes.id_token || "";
       const profile = centralAuthService.parseCenterJwt(token, idToken);
@@ -88,13 +97,32 @@ export async function registerAuthRoutes(fastify: FastifyInstance) {
         centerResponse: centerRes,
       });
     } catch (err: any) {
-      const msg = err.message || "";
-      const is2FaHint = msg.toLowerCase().includes("authenticator") || msg.toLowerCase().includes("otp") || msg.toLowerCase().includes("2fa");
+      // Center asking for a second factor is not a failed login. It is answered
+      // with the challenge — which method, and the reference a delivered code
+      // has to be submitted with — so the client can prompt for the right thing
+      // instead of inferring it from the wording of an error message.
+      if (err instanceof CenterTwoFactorRequiredError) {
+        const { method: challengeMethod, ref: challengeRef } = err.challenge;
+        if (challengeMethod === "email" || challengeMethod === "sms") {
+          // Center names the factor but does not deliver the code.
+          await centralAuthService.sendCenterOtp(username, challengeMethod);
+        }
+        return reply.status(401).send({
+          success: false,
+          error: "Center Two-Factor Required",
+          twoFactorRequired: true,
+          method: challengeMethod,
+          ref: challengeRef,
+          is2FaHint: true,
+          message: "กรุณากรอกรหัสยืนยันตัวตน",
+        });
+      }
+
       return reply.status(401).send({
         success: false,
         error: "Center Authentication Failed",
         message: err.message,
-        is2FaHint,
+        is2FaHint: false,
       });
     }
   });
@@ -349,19 +377,25 @@ export async function registerAuthRoutes(fastify: FastifyInstance) {
     const { username } = parseResult.data;
     const cleanUser = username.trim().toLowerCase();
 
-    // Check if matching customer profile exists in DB
+    // This route verifies no password. It reads a profile and mints a 24-hour
+    // portal token, so it is a demo affordance and nothing more — off unless
+    // someone has explicitly asked for it, and refused outright in production
+    // (env.ts fails the boot if the flag is set there).
+    if (!config.ALLOW_DEMO_LOGIN) {
+      logger.warn({ username: cleanUser, ip: request.ip }, "Demo customer login attempted while ALLOW_DEMO_LOGIN is off");
+      return reply.status(401).send({ error: "Invalid customer account" });
+    }
+
+    // Matched on email only. This used to also match `id::text = $1`, and to
+    // fall back to profile 101 for any username containing "win" or
+    // "customer" — so an arbitrary string was enough to be issued somebody
+    // else's token.
     const profRes = await pool.query(
-      "SELECT id, name, email, phone, company_id FROM profiles WHERE LOWER(email) = $1 OR id::text = $1 LIMIT 1",
+      "SELECT id, name, email, phone, company_id FROM profiles WHERE LOWER(email) = $1 LIMIT 1",
       [cleanUser]
     );
 
-    let customerProfile = profRes.rows[0];
-    if (!customerProfile && (cleanUser.includes("win") || cleanUser.includes("customer"))) {
-      // Fallback to seeded demo customer
-      const demoRes = await pool.query("SELECT id, name, email, phone, company_id FROM profiles WHERE id::text = '101' LIMIT 1");
-      customerProfile = demoRes.rows[0];
-    }
-
+    const customerProfile = profRes.rows[0];
     if (!customerProfile) {
       return reply.status(401).send({ error: "Invalid customer account" });
     }
@@ -408,10 +442,17 @@ export async function registerAuthRoutes(fastify: FastifyInstance) {
     const { username, password } = parseResult.data;
     const cleanUser = username.trim().toLowerCase();
 
-    // Check if this is a Customer account
-    if (cleanUser.includes("customer") || cleanUser === "customer.win@ticketx.local") {
+    // Customer accounts, which carry no password.
+    //
+    // This branch returned a token without ever consulting `password`. The
+    // condition was a substring test on the username, and the query carried
+    // `OR id::text = '101'`, so it matched whatever was sent: posting
+    // {"username":"customer","password":"anything"} was a valid sign-in to the
+    // customer portal. It is now behind the demo flag, and the profile has to
+    // actually match the address given.
+    if (config.ALLOW_DEMO_LOGIN && cleanUser.includes("customer")) {
       const profRes = await pool.query(
-        "SELECT id, name, email, phone, company_id FROM profiles WHERE LOWER(email) = $1 OR id::text = '101' LIMIT 1",
+        "SELECT id, name, email, phone, company_id FROM profiles WHERE LOWER(email) = $1 LIMIT 1",
         [cleanUser]
       );
       if (profRes.rows.length > 0) {
@@ -459,6 +500,56 @@ export async function registerAuthRoutes(fastify: FastifyInstance) {
     if (!passwordOk) {
       logger.warn({ email: username, ip: request.ip }, "Failed operator login");
       return reply.status(401).send({ error: "Invalid username or password" });
+    }
+
+    // If account has role 'customer', issue Customer Portal token instead of rejecting with 403
+    if (operator.role === 'customer') {
+      const profRes = await pool.query(
+        "SELECT id, name, email, phone, company_id FROM profiles WHERE LOWER(email) = $1 ORDER BY id ASC LIMIT 1",
+        [cleanUser]
+      );
+      const customerProfile = profRes.rows[0];
+      const identRes = await pool.query(
+        "SELECT channel_ref, org_id FROM identities WHERE profile_id::text = $1::text LIMIT 1",
+        [String(customerProfile?.id || operator.id)]
+      );
+      const channelRef = identRes.rows[0]?.channel_ref || `cust_${customerProfile?.id || operator.id}`;
+      const orgId = identRes.rows[0]?.org_id || "org_excise";
+
+      const projRes = await pool.query(
+        "SELECT project_id FROM profile_projects WHERE profile_id::text = $1::text",
+        [String(customerProfile?.id || operator.id)]
+      );
+      const projectIds = projRes.rows.map((r: any) => Number(r.project_id)).filter((n: number) => Number.isInteger(n));
+
+      const { getWebchatJwtSecret } = await import("../../middleware/customerAuth");
+      const jwtSecret = getWebchatJwtSecret();
+      const proofToken = JwtUtil.sign({
+        customerId: channelRef,
+        name: customerProfile?.name || 'คุณวิน (ลูกค้า)',
+        email: operator.email,
+        companyId: String(customerProfile?.company_id || 101),
+        projectId: String(projectIds[0] || 101),
+      }, jwtSecret, 86400);
+
+      logger.info({ email: operator.email }, "Customer signed in via verified password");
+
+      return reply.send({
+        success: true,
+        role: "customer",
+        token: proofToken,
+        proofToken,
+        expiresAt: Date.now() + 86400 * 1000,
+        user: {
+          username: operator.email,
+          email: operator.email,
+          name: customerProfile?.name || 'คุณวิน (ลูกค้า)',
+          role: "customer",
+          orgId,
+          companyId: customerProfile?.company_id || 101,
+          projectIds: projectIds.length > 0 ? projectIds : [101],
+        }
+      });
     }
 
     let principal;
